@@ -4015,6 +4015,41 @@ The table alignment uses:
   expect(headingSpan2!.attributes & TextAttributes.BOLD).toBeTruthy()
 })
 
+test("narrow markdown list wrapping does not duplicate CJK glyphs at wrap boundary", async () => {
+  // 38列外框减去两侧padding后只剩34列，保留“文本盒外仍可绘制”的真实边界。
+  // 该几何会让错误chunk在上一行多画一个双宽汉字，不能缩成与文本盒同宽的framebuffer。
+  const md = createMarkdownRenderable({
+    id: "markdown-cjk-wrap-regression",
+    content: "- 在aber (“但”)引入的转折从句前表示让步：虽然，的确",
+    syntaxStyle,
+    conceal: true,
+  })
+
+  const wrapper = new BoxRenderable(renderer, {
+    id: "markdown-cjk-wrap-wrapper",
+    width: 38,
+    paddingLeft: 2,
+    paddingRight: 2,
+  })
+
+  wrapper.add(md)
+  renderer.root.add(wrapper)
+  await renderMarkdownRenderable(md)
+
+  const lines = captureFrame()
+    .split("\n")
+    .map((line) => line.trimEnd())
+
+  // 固定literal frame而非复算wrap算法，确保expected value独立于production offset实现。
+  // “但”和后续中文只能按源顺序各出现一次，跨行重复会直接改变该可观察快照。
+  expect("\n" + lines.join("\n").trimEnd()).toMatchInlineSnapshot(`
+    "
+      - 在aber (“但”)
+      引入的转折从句前表示让步：虽然，
+      的确"
+  `)
+})
+
 // Paragraph rendering tests
 
 test("paragraph links are rendered with markdown conceal behavior", async () => {

@@ -1158,6 +1158,10 @@ pub const UnifiedTextBufferView = struct {
                         var wrap_idx: usize = 0;
 
                         while (char_offset < chunk.width) {
+                            // stored列宽可能因tab配置变化而大于剩余bytes能表达的宽度。
+                            // UTF-8 bytes耗尽才是消费终点，避免零进度wrap形成无限循环。
+                            if (byte_offset >= chunk_bytes.len) break;
+
                             const line_wrap_w = wctx.lineWrapWidth();
                             const remaining_in_chunk = chunk.width - char_offset;
                             const remaining_on_line = if (wctx.line_position < line_wrap_w) line_wrap_w - wctx.line_position else 0;
@@ -1206,15 +1210,13 @@ pub const UnifiedTextBufferView = struct {
                                 to_add = boundary_w;
                                 has_wrap_after = true;
                             } else if (wctx.line_position == 0) {
-                                // Use tracked byte_offset instead of recalculating from scratch (avoids O(n²))
                                 const remaining_bytes = chunk_bytes[byte_offset..];
                                 const wrap_result = utf8.findWrapPosByWidth(remaining_bytes, remaining_on_line, wctx.text_buffer.tabWidth(), is_ascii_only, wctx.text_buffer.widthMethod());
                                 to_add = wrap_result.columns_used;
-                                byte_offset += wrap_result.byte_offset;
                                 if (to_add == 0) {
-                                    to_add = 1;
-                                    const single_result = utf8.findWrapPosByWidth(remaining_bytes, 1, wctx.text_buffer.tabWidth(), is_ascii_only, wctx.text_buffer.widthMethod());
-                                    byte_offset += single_result.byte_offset;
+                                    // 窄行也要强制消费一个完整grapheme，不能把双宽字符拆成单cell。
+                                    const force_result = utf8.findPosByWidth(remaining_bytes, 1, wctx.text_buffer.tabWidth(), is_ascii_only, true, wctx.text_buffer.widthMethod());
+                                    to_add = force_result.columns_used;
                                 }
                             } else if (wctx.last_wrap_chunk_count > 0 and
                                 wctx.last_wrap_chunk_count <= wctx.current_vline.chunks.items.len)
@@ -1273,18 +1275,13 @@ pub const UnifiedTextBufferView = struct {
                                 continue;
                             } else {
                                 commitVirtualLine(wctx);
-                                if (char_offset > 0) {
-                                    const pos_result = utf8.findPosByWidth(chunk_bytes, char_offset, wctx.text_buffer.tabWidth(), is_ascii_only, false, wctx.text_buffer.widthMethod());
-                                    byte_offset = pos_result.byte_offset;
-                                }
                                 const remaining_bytes = chunk_bytes[byte_offset..];
                                 const wrap_result = utf8.findWrapPosByWidth(remaining_bytes, wctx.lineWrapWidth(), wctx.text_buffer.tabWidth(), is_ascii_only, wctx.text_buffer.widthMethod());
                                 to_add = wrap_result.columns_used;
-                                byte_offset += wrap_result.byte_offset;
                                 if (to_add == 0) {
-                                    to_add = 1;
-                                    const single_result = utf8.findWrapPosByWidth(remaining_bytes, 1, wctx.text_buffer.tabWidth(), is_ascii_only, wctx.text_buffer.widthMethod());
-                                    byte_offset += single_result.byte_offset;
+                                    // 新行仍放不下时消费完整grapheme，保持virtual chunk边界合法。
+                                    const force_result = utf8.findPosByWidth(remaining_bytes, 1, wctx.text_buffer.tabWidth(), is_ascii_only, true, wctx.text_buffer.widthMethod());
+                                    to_add = force_result.columns_used;
                                 }
                             }
 
@@ -1294,6 +1291,12 @@ pub const UnifiedTextBufferView = struct {
 
                                 addVirtualChunk(wctx, chunk, chunk_idx_in_line, char_offset, to_add);
                                 char_offset += to_add;
+
+                                // column与byte必须在同一消费点推进，之后任何wrap分支都从同一源位置继续。
+                                // 只在分支内更新其中一个offset会让CJK第二个cell被上一行和下一行重复引用。
+                                const remaining_bytes = chunk_bytes[byte_offset..];
+                                const advance_result = utf8.findWrapPosByWidth(remaining_bytes, to_add, wctx.text_buffer.tabWidth(), is_ascii_only, wctx.text_buffer.widthMethod());
+                                byte_offset += advance_result.byte_offset;
 
                                 if (has_wrap_after) {
                                     const wrap_pos_in_added = if (last_wrap_that_fits) |boundary_w|

@@ -710,6 +710,90 @@ test "TextBufferView word wrapping - CJK boundary width" {
     try std.testing.expectEqual(@as(u32, 2), vlines[1].width_cols);
 }
 
+test "TextBufferView word wrapping - narrow line keeps wide grapheme intact" {
+    // wrap width小于双宽字形时仍必须消费完整grapheme，不能制造半个cell或零进度循环。
+    // 这里直接断言virtual chunk的公开布局结果，不依赖内部offset helper的调用方式。
+    const pool = gp.initGlobalPool(std.testing.allocator);
+    defer gp.deinitGlobalPool();
+    const link_pool = link.initGlobalLinkPool(std.testing.allocator);
+    defer link.deinitGlobalLinkPool();
+
+    var tb = try TextBuffer.init(std.testing.allocator, pool, link_pool, .unicode);
+    defer tb.deinit();
+
+    var view = try TextBufferView.init(std.testing.allocator, tb);
+    defer view.deinit();
+
+    try tb.setText("确");
+
+    view.setWrapMode(.word);
+    view.setWrapWidth(1);
+    const vlines = view.getVirtualLines();
+
+    try std.testing.expectEqual(@as(usize, 1), vlines.len);
+    try std.testing.expectEqual(@as(u32, 2), vlines[0].width_cols);
+    try std.testing.expectEqual(@as(usize, 1), vlines[0].chunks.items.len);
+    try std.testing.expectEqual(@as(u32, 0), vlines[0].chunks.items[0].grapheme_start);
+    try std.testing.expectEqual(@as(u32, 2), vlines[0].chunks.items[0].width);
+}
+
+test "TextBufferView word wrapping - CJK boundary keeps byte and column offsets aligned" {
+    // 混合ASCII、标点和CJK会让column offset与UTF-8 byte offset按不同步长推进。
+    // 每行literal start/width共同锁定两种offset始终表示同一个源文本位置。
+    const pool = gp.initGlobalPool(std.testing.allocator);
+    defer gp.deinitGlobalPool();
+    const link_pool = link.initGlobalLinkPool(std.testing.allocator);
+    defer link.deinitGlobalLinkPool();
+
+    var tb = try TextBuffer.init(std.testing.allocator, pool, link_pool, .unicode);
+    defer tb.deinit();
+
+    var view = try TextBufferView.init(std.testing.allocator, tb);
+    defer view.deinit();
+
+    try tb.setText("在aber (“但”)引入的转折从句前表示让步：虽然，的确");
+
+    view.setWrapMode(.word);
+    view.setWrapWidth(15);
+    const vlines = view.getVirtualLines();
+
+    const expected_widths = [_]u32{ 13, 14, 14, 8 };
+    const expected_starts = [_]u32{ 0, 13, 27, 41 };
+    try std.testing.expectEqual(expected_widths.len, vlines.len);
+    for (vlines, expected_widths, expected_starts) |vline, expected_width, expected_start| {
+        try std.testing.expectEqual(expected_width, vline.width_cols);
+        try std.testing.expectEqual(@as(usize, 1), vline.chunks.items.len);
+        try std.testing.expectEqual(expected_start, vline.chunks.items[0].grapheme_start);
+    }
+}
+
+test "TextBufferView word wrapping - tab width decrease terminates after bytes are consumed" {
+    // tab width在写入后缩小时，stored column width可能大于剩余UTF-8 bytes能表达的宽度。
+    // byte boundary是终止权威；测试要求有限virtual lines而不是依赖超时发现死循环。
+    const pool = gp.initGlobalPool(std.testing.allocator);
+    defer gp.deinitGlobalPool();
+    const link_pool = link.initGlobalLinkPool(std.testing.allocator);
+    defer link.deinitGlobalLinkPool();
+
+    var tb = try TextBuffer.init(std.testing.allocator, pool, link_pool, .unicode);
+    defer tb.deinit();
+
+    var view = try TextBufferView.init(std.testing.allocator, tb);
+    defer view.deinit();
+
+    tb.setTabWidth(4);
+    try tb.setText("\tX");
+    tb.setTabWidth(2);
+
+    view.setWrapMode(.word);
+    view.setWrapWidth(1);
+    const vlines = view.getVirtualLines();
+
+    try std.testing.expectEqual(@as(usize, 2), vlines.len);
+    try std.testing.expectEqual(@as(u32, 2), vlines[0].width_cols);
+    try std.testing.expectEqual(@as(u32, 1), vlines[1].width_cols);
+}
+
 test "TextBufferView word wrapping - compare char vs word mode" {
     const pool = gp.initGlobalPool(std.testing.allocator);
     defer gp.deinitGlobalPool();

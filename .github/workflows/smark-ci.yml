@@ -1,0 +1,62 @@
+name: SMARK Package CI
+
+on:
+  push:
+    branches: [smark/main]
+  pull_request:
+    branches: [smark/main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  packages:
+    name: Build Package Closure
+    uses: ./.github/workflows/build-native.yml
+    with:
+      artifact-name: smark-packages-${{ github.sha }}
+
+  verify:
+    name: Verify Packages (${{ matrix.os }})
+    needs: packages
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-latest, ubuntu-24.04-arm, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Download package closure
+        uses: actions/download-artifact@v8
+        with:
+          name: smark-packages-${{ github.sha }}
+          path: artifacts/npm-packages
+
+      - name: Verify installed package behavior
+        run: >-
+          bun scripts/verify-release-packages.ts
+          --directory artifacts/npm-packages
+          --version "${{ needs.packages.outputs.version }}"
+
+  complete:
+    name: SMARK Packages - Complete
+    needs: [packages, verify]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce all package gates
+        run: |
+          # 聚合job让branch protection只依赖一个稳定名称，matrix中任一平台失败都不能被忽略。
+          test "${{ needs.packages.result }}" = "success"
+          test "${{ needs.verify.result }}" = "success"

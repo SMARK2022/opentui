@@ -1,12 +1,18 @@
 # OpenTUI
 
 <div align="center">
-    <a href="https://www.npmjs.com/package/@opentui/core"><img alt="npm" src="https://img.shields.io/npm/v/@opentui/core?style=flat-square" /></a>
-    <a href="https://github.com/anomalyco/opentui/actions/workflows/build-core.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/anomalyco/opentui/build-core.yml?style=flat-square&branch=main" /></a>
+    <a href="https://github.com/SMARK2022/opentui/releases"><img alt="SMARK release" src="https://img.shields.io/github/v/release/SMARK2022/opentui?display_name=tag&style=flat-square" /></a>
+    <a href="https://github.com/SMARK2022/opentui/actions/workflows/smark-ci.yml"><img alt="SMARK build status" src="https://img.shields.io/github/actions/workflow/status/SMARK2022/opentui/smark-ci.yml?style=flat-square&branch=smark%2Fmain" /></a>
     <a href="https://github.com/msmps/awesome-opentui"><img alt="awesome opentui list" src="https://awesome.re/badge-flat.svg" /></a>
 </div>
 
 OpenTUI is a native terminal UI core written in Zig with TypeScript bindings. The native core exposes a C ABI and can be used from any language. OpenTUI powers [OpenCode](https://opencode.ai) in production today and will also power [terminal.shop](https://terminal.shop). It is an extensible core with a focus on correctness, stability, and high performance. It provides a component-based architecture with flexible layout capabilities, allowing you to create complex terminal applications.
+
+## SMARK distribution branch
+
+The default `smark/main` branch is based on upstream OpenTUI `v0.4.3` (`5803b2cfa2942c45a3aedbb3601754e27f2cdc68`) and includes the complete fix from [anomalyco/opentui#845](https://github.com/anomalyco/opentui/pull/845) (`6fbf515ca60c1171ce0d6335088a66bbc94a354f`).
+
+`v0.4.3-smark.1` publishes `@opentui/core`, `@opentui/solid`, `@opentui/keymap`, and all eight native packages as npm-compatible tarballs in an immutable GitHub Release. OpenCode consumes those release assets; its `thirdparty/opentui` submodule records source provenance and is not a build fallback. Windows DLL assets are currently unsigned because this fork does not possess upstream's Azure signing credentials.
 
 Docs: https://opentui.com/docs/getting-started
 

@@ -83,11 +83,8 @@ try {
   // 先按真实HTTP URL安装，再重复OpenCode build.ts的target reinstall调用。
   // catalog只表达版本合同，11个overrides才是唯一package source；两层缺一都不代表生产路径。
   await run(["bun", "install", "--linker=hoisted"], temp)
-  await run(
-    // root install已经验证catalog；嵌套consumer在Windows上无法向父workspace解析catalog，target reinstall改用同一语义版本并继续由overrides寻址11-pack。
-    ["bun", "install", `--os=${process.platform}`, `--cpu=${process.arch}`, `@opentui/core@${version}`],
-    consumer,
-  )
+  // target reinstall必须从root workspace执行；Windows的嵌套cwd不会继承父级catalog/overrides。
+  await run(["bun", "install", `--os=${process.platform}`, `--cpu=${process.arch}`, "--filter=consumer"], temp)
 
   // 先观察用户可见的42/35 frame；official 0.4.3必须在这里以2/3 red，而不是被metadata失败替代。
   // literal输入和期望计数独立于native wrap算法，package能安装但未承载#845时仍会被拒绝。

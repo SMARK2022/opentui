@@ -84,7 +84,8 @@ try {
   // catalog只表达版本合同，11个overrides才是唯一package source；两层缺一都不代表生产路径。
   await run(["bun", "install", "--linker=hoisted"], temp)
   await run(
-    ["bun", "install", `--os=${process.platform}`, `--cpu=${process.arch}`, "@opentui/core@catalog:"],
+    // root install已经验证catalog；嵌套consumer在Windows上无法向父workspace解析catalog，target reinstall改用同一语义版本并继续由overrides寻址11-pack。
+    ["bun", "install", `--os=${process.platform}`, `--cpu=${process.arch}`, `@opentui/core@${version}`],
     consumer,
   )
 

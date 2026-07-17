@@ -54,7 +54,7 @@ jobs:
           echo "value=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Install source dependencies
-        run: bun install --frozen-lockfile --omit=optional
+        run: bun install --frozen-lockfile --omit=optional --linker=hoisted
 
       - name: Run #845 focused native regression
         working-directory: packages/core/src/zig

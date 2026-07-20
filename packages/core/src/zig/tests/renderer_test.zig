@@ -807,6 +807,32 @@ test "renderer - unchanged grapheme should not churn IDs across frames" {
     try std.testing.expect(std.mem.indexOf(u8, second_output, "👋") == null);
 }
 
+test "renderer - wide emoji to placeholder clears old terminal footprint" {
+    // 独立期望是旧宽span必须先写两个空格；仅看到新[]并不能证明终端旧glyph已经被清除。
+    // 第三帧再恢复原始emoji，验证preclear没有破坏current buffer的continuation ownership。
+    const pool = gp.initGlobalPool(std.testing.allocator);
+    defer gp.deinitGlobalPool();
+    var test_renderer = try TestRenderer.create(std.testing.allocator, 8, 2, pool);
+    defer test_renderer.deinit();
+    const cli_renderer = test_renderer.renderer;
+    const fg = ansi.rgbaFromFloats(1, 1, 1, 1);
+    const bg = ansi.rgbaFromFloats(0, 0, 0, 1);
+
+    try cli_renderer.getNextBuffer().drawText("A👨‍👩‍👧‍👦B", 0, 0, fg, bg, 0);
+    _ = cli_renderer.render(false);
+    try cli_renderer.getNextBuffer().drawText("A[]B", 0, 0, fg, bg, 0);
+    _ = cli_renderer.render(false);
+
+    const frame_two = test_renderer.lastOutput();
+    try std.testing.expect(std.mem.indexOf(u8, frame_two, "\x1b[1;2H  ") != null);
+    try std.testing.expectEqual(@as(u32, '['), cli_renderer.getCurrentBuffer().get(1, 0).?.char);
+    try std.testing.expectEqual(@as(u32, ']'), cli_renderer.getCurrentBuffer().get(2, 0).?.char);
+
+    try cli_renderer.getNextBuffer().drawText("A👨‍👩‍👧‍👦B", 0, 0, fg, bg, 0);
+    _ = cli_renderer.render(false);
+    try std.testing.expect(std.mem.indexOf(u8, test_renderer.lastOutput(), "👨‍👩‍👧‍👦") != null);
+}
+
 test "renderer - grows frame output instead of committing cells whose ANSI was dropped" {
     const pool = gp.initGlobalPool(std.testing.allocator);
     defer gp.deinitGlobalPool();

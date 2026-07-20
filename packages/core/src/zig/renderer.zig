@@ -1375,6 +1375,20 @@ pub const CliRenderer = struct {
                     frame_started = true;
                 }
 
+                if (!should_force and gp.isGraphemeChar(currentCell.?.char) and
+                    gp.charRightExtent(currentCell.?.char) > 0 and currentCell.?.char != cell.char)
+                {
+                    // 宽字形被placeholder或新字形替换时，先清掉旧的完整占位宽度；否则终端会保留旧glyph的第二个cell。
+                    // 只在当前cell是旧span的canonical start时清理，continuation迭代不会重复覆盖新输出。
+                    // 清理后重新锚定cursor，保证后续ANSI仍从next buffer的真实起点开始。
+                    ansi.ANSI.moveToOutput(writer, x + 1, y + 1 + self.renderOffset) catch {};
+                    var clear_width: u32 = 0;
+                    while (clear_width <= gp.charRightExtent(currentCell.?.char)) : (clear_width += 1) {
+                        writer.writeByte(' ') catch {};
+                    }
+                    ansi.ANSI.moveToOutput(writer, x + 1, y + 1 + self.renderOffset) catch {};
+                }
+
                 const fgMatch = currentFg != null and buf.rgbaEqual(currentFg.?, cell.fg);
                 const bgMatch = currentBg != null and buf.rgbaEqual(currentBg.?, cell.bg);
                 const sameAttributes = fgMatch and bgMatch and currentAttributes != null and cell.attributes == currentAttributes.?;

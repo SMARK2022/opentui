@@ -1885,6 +1885,74 @@ test "OptimizedBuffer - fillRect alpha path preserves underlying text without tr
     try std.testing.expect(ansi.redF(filled.fg) > 0.9);
 }
 
+test "buffer - raw alpha path preserves wide CJK span without trackers" {
+    // setRaw模拟真实framebuffer快路径留下的cell编码，故意不填充tracker来覆盖raw producer。
+    // 期望值直接比较start/continuation编码，而不是只比较最终可见字符串。
+    const pool = gp.initGlobalPool(std.testing.allocator);
+    defer gp.deinitGlobalPool();
+
+    var source = try OptimizedBuffer.init(std.testing.allocator, 4, 1, .{ .pool = pool, .id = "wide-source" });
+    defer source.deinit();
+    var target = try OptimizedBuffer.init(std.testing.allocator, 4, 1, .{ .pool = pool, .id = "wide-target" });
+    defer target.deinit();
+
+    const solid_bg = ansi.rgbaFromFloats(0, 0, 0, 1);
+    const fg = ansi.rgbaFromFloats(1, 1, 1, 1);
+    try source.drawText("中", 1, 0, fg, solid_bg, 0);
+    target.setRaw(1, 0, source.get(1, 0).?);
+    target.setRaw(2, 0, source.get(2, 0).?);
+    try std.testing.expect(!target.grapheme_tracker.hasAny());
+
+    target.fillRect(1, 0, 2, 1, ansi.rgbaFromFloats(0, 0, 1, 0.5));
+
+    try std.testing.expectEqual(source.get(1, 0).?.char, target.get(1, 0).?.char);
+    try std.testing.expectEqual(source.get(2, 0).?.char, target.get(2, 0).?.char);
+    try std.testing.expect(gp.isGraphemeChar(target.get(1, 0).?.char));
+    try std.testing.expect(gp.isContinuationChar(target.get(2, 0).?.char));
+}
+
+test "buffer - full covered color emoji becomes exact placeholder cells" {
+    // []合同要求两个独立ASCII cell；只断言宽度会允许单个placeholder或残留continuation蒙混通过。
+    const pool = gp.initGlobalPool(std.testing.allocator);
+    defer gp.deinitGlobalPool();
+
+    var buf = try OptimizedBuffer.init(std.testing.allocator, 6, 1, .{ .pool = pool, .id = "emoji-placeholder" });
+    defer buf.deinit();
+    const solid_bg = ansi.rgbaFromFloats(0, 0, 0, 1);
+    const fg = ansi.rgbaFromFloats(1, 1, 1, 1);
+    try buf.drawText("😀", 1, 0, fg, solid_bg, 0);
+    buf.fillRect(1, 0, 2, 1, ansi.rgbaFromFloats(0, 0, 1, 0.5));
+
+    const left = buf.get(1, 0).?;
+    const right = buf.get(2, 0).?;
+    try std.testing.expectEqual(@as(u32, '['), left.char);
+    try std.testing.expectEqual(@as(u32, ']'), right.char);
+    try std.testing.expect(!gp.isGraphemeChar(left.char));
+    try std.testing.expect(!gp.isContinuationChar(right.char));
+    try std.testing.expect(!buf.grapheme_tracker.hasAny());
+}
+
+test "buffer - clipped half emoji preserves the original span" {
+    // scissor只可写入可见cell，半覆盖不能越界重写另一半span，因此应保留原始emoji编码。
+    const pool = gp.initGlobalPool(std.testing.allocator);
+    defer gp.deinitGlobalPool();
+
+    var buf = try OptimizedBuffer.init(std.testing.allocator, 6, 1, .{ .pool = pool, .id = "emoji-clipped" });
+    defer buf.deinit();
+    const solid_bg = ansi.rgbaFromFloats(0, 0, 0, 1);
+    const fg = ansi.rgbaFromFloats(1, 1, 1, 1);
+    try buf.drawText("😀", 1, 0, fg, solid_bg, 0);
+    const original_left = buf.get(1, 0).?.char;
+    const original_right = buf.get(2, 0).?.char;
+    try buf.pushScissorRect(1, 0, 1, 1);
+    defer buf.popScissorRect();
+
+    buf.fillRect(1, 0, 2, 1, ansi.rgbaFromFloats(0, 0, 1, 0.5));
+
+    try std.testing.expectEqual(original_left, buf.get(1, 0).?.char);
+    try std.testing.expectEqual(original_right, buf.get(2, 0).?.char);
+}
+
 test "OptimizedBuffer - fillRect transparent path is a no-op without trackers" {
     const pool = gp.initGlobalPool(std.testing.allocator);
     defer gp.deinitGlobalPool();

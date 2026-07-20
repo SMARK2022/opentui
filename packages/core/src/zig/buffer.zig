@@ -178,6 +178,17 @@ pub const OptimizedBuffer = struct {
     scissor_stack: std.ArrayListUnmanaged(ClipRect),
     opacity_stack: std.ArrayListUnmanaged(f32),
 
+    // 宽字形分类决定遮罩是否可以把不可重染色的彩色emoji替换为ASCII占位。
+    // CJK和普通宽文本必须保留原始grapheme，不能因为共享了宽度而改变用户内容。
+    // unknown保守地走原始span保留路径，避免误把未知组合序列拆成两个cell。
+    const WideCharKind = enum { wide_text, emoji, unknown };
+
+    const GraphemeSpan = struct {
+        start: u32,
+        end: u32,
+        id: u32,
+    };
+
     const InitOptions = struct {
         respectAlpha: bool = false,
         blendBackdropColor: ?RGBA = null,
@@ -752,12 +763,9 @@ pub const OptimizedBuffer = struct {
             const charIsDefaultSpace = overlayCell.char == DEFAULT_SPACE_CHAR;
             const destNotZero = destCell.char != 0;
             const destNotDefaultSpace = destCell.char != DEFAULT_SPACE_CHAR;
-            const destWidthIsOne = gp.encodedCharWidth(destCell.char) == 1;
-
             const preserveChar = (charIsDefaultSpace and
                 destNotZero and
-                destNotDefaultSpace and
-                destWidthIsOne);
+                destNotDefaultSpace);
             const finalChar = if (preserveChar) destCell.char else overlayCell.char;
 
             var finalFg: RGBA = undefined;
@@ -792,6 +800,76 @@ pub const OptimizedBuffer = struct {
         return overlayCell;
     }
 
+    fn classifyWideChar(self: *const OptimizedBuffer, char: u32) WideCharKind {
+        // 组合emoji不能用单个codepoint宽度判断；先读首codepoint，再检查ZWJ/变体选择器。
+        // 这条判断只影响完整span覆盖时的可见placeholder，不改变终端的普通宽度计算。
+        var codepoint = char;
+        var sequence_emoji = false;
+        if (gp.isGraphemeChar(char) or gp.isContinuationChar(char)) {
+            const bytes = self.pool.get(gp.graphemeIdFromChar(char)) catch return .unknown;
+            if (bytes.len == 0) return .unknown;
+            const first_len = std.unicode.utf8ByteSequenceLength(bytes[0]) catch return .unknown;
+            if (first_len > bytes.len) return .unknown;
+            codepoint = std.unicode.utf8Decode(bytes[0..first_len]) catch return .unknown;
+            sequence_emoji = std.mem.indexOf(u8, bytes, "\xE2\x80\x8D") != null or
+                std.mem.indexOf(u8, bytes, "\xEF\xB8\x8F") != null or
+                std.mem.indexOf(u8, bytes, "\x20\xE3") != null;
+        }
+        if (sequence_emoji or (codepoint >= 0x1F000 and codepoint <= 0x1FAFF) or
+            (codepoint >= 0x2600 and codepoint <= 0x27BF)) return .emoji;
+        if (codepoint <= MAX_UNICODE_CODEPOINT and utf8.eastAsianWidth(@intCast(codepoint)) == 2) return .wide_text;
+        return .unknown;
+    }
+
+    fn shouldPlaceholderWideChar(self: *const OptimizedBuffer, char: u32) bool {
+        return self.classifyWideChar(char) == .emoji;
+    }
+
+    fn graphemeSpanForIndex(self: *const OptimizedBuffer, index: u32, char: u32) GraphemeSpan {
+        const row_start = index - (index % self.width);
+        const row_end = row_start + self.width - 1;
+        return .{
+            .start = index - @min(gp.charLeftExtent(char), index - row_start),
+            .end = index + @min(gp.charRightExtent(char), row_end - index),
+            .id = gp.graphemeIdFromChar(char),
+        };
+    }
+
+    fn applyCellStyleToGraphemeSpan(self: *OptimizedBuffer, span: GraphemeSpan, style: Cell) void {
+        // 只更新span内每个cell的样式，字符和continuation编码保持来自同一个原始grapheme。
+        // 使用setRaw避免重新清理正在保留的span，同时仍让link tracker看到属性变化。
+        var index = span.start;
+        while (index <= span.end) : (index += 1) {
+            const x = index % self.width;
+            const y = index / self.width;
+            if (!self.isPointInScissor(@intCast(x), @intCast(y))) continue;
+            const current = self.get(x, y) orelse continue;
+            if (!(gp.isGraphemeChar(current.char) or gp.isContinuationChar(current.char))) continue;
+            if (gp.graphemeIdFromChar(current.char) != span.id) continue;
+            self.setRaw(x, y, makeCell(current.char, style.fg, style.bg, style.attributes));
+        }
+    }
+
+    fn blendPreservedGraphemeSpan(self: *OptimizedBuffer, index: u32, overlayCell: Cell) void {
+        // 无论调用从start还是continuation进入，都回到canonical start取同一份样式基准。
+        // 这样半透明颜色不会因两个cell分别取样而产生可见的宽字形断层。
+        const span = self.graphemeSpanForIndex(index, self.buffer.char[index]);
+        const source = self.get(span.start % self.width, span.start / self.width) orelse return;
+        self.applyCellStyleToGraphemeSpan(span, self.blendCells(overlayCell, source));
+    }
+
+    fn renderPlaceholder(self: *OptimizedBuffer, span: GraphemeSpan, overlayCell: Cell) void {
+        // []是完整覆盖彩色emoji时唯一的可见语义；它必须是两个普通ASCII cell，不能携带旧grapheme id。
+        // 调用者已确认span两端都在scissor内，半覆盖场景不会进入这里并保留原始emoji。
+        const source = self.get(span.start % self.width, span.start / self.width) orelse return;
+        const blended = self.blendCells(overlayCell, source);
+        const attributes = ansi.TextAttributes.setLinkId(ansi.TextAttributes.getBaseAttributes(blended.attributes), 0);
+        const x = span.start % self.width;
+        const y = span.start / self.width;
+        self.set(x, y, makeCell('[', blended.fg, blended.bg, attributes));
+        if (span.end > span.start) self.set(x + 1, y, makeCell(']', blended.fg, blended.bg, attributes));
+    }
+
     pub fn setCellWithAlphaBlending(
         self: *OptimizedBuffer,
         x: u32,
@@ -801,17 +879,17 @@ pub const OptimizedBuffer = struct {
         bg: RGBA,
         attributes: u32,
     ) void {
-        self.setCellWithAlphaBlendingCell(x, y, makeCell(char, fg, bg, attributes));
+        _ = self.setCellWithAlphaBlendingCell(x, y, makeCell(char, fg, bg, attributes));
     }
 
-    fn setCellWithAlphaBlendingCell(self: *OptimizedBuffer, x: u32, y: u32, cell: Cell) void {
-        if (!self.isPointInScissor(@intCast(x), @intCast(y))) return;
+    fn setCellWithAlphaBlendingCell(self: *OptimizedBuffer, x: u32, y: u32, cell: Cell) u32 {
+        if (!self.isPointInScissor(@intCast(x), @intCast(y))) return x;
 
         const opacity = self.getCurrentOpacity();
-        if (isFullyTransparent(opacity, cell.fg, cell.bg)) return;
+        if (isFullyTransparent(opacity, cell.fg, cell.bg)) return x;
         if (isFullyOpaque(opacity, cell.fg, cell.bg)) {
             self.set(x, y, cell);
-            return;
+            return x;
         }
 
         const opacity_u8 = opacityToU8(opacity);
@@ -822,12 +900,36 @@ pub const OptimizedBuffer = struct {
             cell.attributes,
         );
 
-        if (self.get(x, y)) |destCell| {
-            const blendedCell = self.blendCells(effectiveCell, destCell);
-            self.set(x, y, blendedCell);
-        } else {
+        const destCell = self.get(x, y) orelse {
             self.set(x, y, effectiveCell);
+            return x;
+        };
+
+        const blendedCell = self.blendCells(effectiveCell, destCell);
+        const preservesWide = blendedCell.char == destCell.char and
+            (gp.isGraphemeChar(destCell.char) or gp.isContinuationChar(destCell.char)) and
+            gp.charLeftExtent(destCell.char) + gp.charRightExtent(destCell.char) > 0;
+        if (!preservesWide) {
+            self.set(x, y, blendedCell);
+            return x;
         }
+
+        if (effectiveCell.char == DEFAULT_SPACE_CHAR and self.shouldPlaceholderWideChar(destCell.char)) {
+            const index = self.coordsToIndex(x, y);
+            const span = self.graphemeSpanForIndex(index, destCell.char);
+            const start_x = span.start % self.width;
+            const end_x = span.end % self.width;
+            const span_y = span.start / self.width;
+            if (self.isPointInScissor(@intCast(start_x), @intCast(span_y)) and
+                self.isPointInScissor(@intCast(end_x), @intCast(span_y)))
+            {
+                self.renderPlaceholder(span, effectiveCell);
+                return end_x;
+            }
+        }
+
+        self.blendPreservedGraphemeSpan(self.coordsToIndex(x, y), effectiveCell);
+        return x + gp.charRightExtent(destCell.char);
     }
 
     pub fn setCellWithAlphaBlendingRaw(
@@ -843,35 +945,8 @@ pub const OptimizedBuffer = struct {
     }
 
     fn setCellWithAlphaBlendingRawCell(self: *OptimizedBuffer, x: u32, y: u32, cell: Cell) void {
-        if (!self.isPointInScissor(@intCast(x), @intCast(y))) return;
-
-        const opacity = self.getCurrentOpacity();
-        if (isFullyTransparent(opacity, cell.fg, cell.bg)) return;
-        if (isFullyOpaque(opacity, cell.fg, cell.bg)) {
-            assert(!gp.isGraphemeChar(cell.char));
-            assert(!gp.isContinuationChar(cell.char));
-            self.setRaw(x, y, cell);
-            return;
-        }
-
-        const opacity_u8 = opacityToU8(opacity);
-        const effectiveCell = makeCell(
-            cell.char,
-            applyOpacity(cell.fg, opacity_u8),
-            applyOpacity(cell.bg, opacity_u8),
-            cell.attributes,
-        );
-
-        if (self.get(x, y)) |destCell| {
-            const blendedCell = self.blendCells(effectiveCell, destCell);
-            assert(!gp.isGraphemeChar(blendedCell.char));
-            assert(!gp.isContinuationChar(blendedCell.char));
-            self.setRaw(x, y, blendedCell);
-        } else {
-            assert(!gp.isGraphemeChar(effectiveCell.char));
-            assert(!gp.isContinuationChar(effectiveCell.char));
-            self.setRaw(x, y, effectiveCell);
-        }
+        // raw caller可能没有tracker但目标cell仍来自setRaw的宽grapheme；统一回到span owner，禁止第二套逐cell语义。
+        _ = self.setCellWithAlphaBlendingCell(x, y, cell);
     }
 
     inline fn trySetTransparentTextCellFast(
@@ -915,7 +990,7 @@ pub const OptimizedBuffer = struct {
         bg: RGBA,
         attributes: u32,
     ) void {
-        self.setCellWithAlphaBlendingCell(x, y, makeCell(char, fg, bg, attributes));
+        _ = self.setCellWithAlphaBlendingCell(x, y, makeCell(char, fg, bg, attributes));
     }
 
     pub fn fillRect(
@@ -960,7 +1035,7 @@ pub const OptimizedBuffer = struct {
             while (fillY <= clippedEndY) : (fillY += 1) {
                 var fillX = clippedStartX;
                 while (fillX <= clippedEndX) : (fillX += 1) {
-                    self.setCellWithAlphaBlendingCell(
+                    _ = self.setCellWithAlphaBlendingCell(
                         fillX,
                         fillY,
                         makeCell(DEFAULT_SPACE_CHAR, ansi.rgbColor(255, 255, 255, 255), bg, 0),
@@ -968,8 +1043,7 @@ pub const OptimizedBuffer = struct {
                 }
             }
         } else if (hasAlpha) {
-            // No grapheme/link bookkeeping is needed here, so the raw blend
-            // path avoids the extra tracker work done by the generic setter.
+            // raw分支只省略tracker查找，不能省略宽span语义；否则framebuffer和直接fill会产生不同结果。
             var fillY = clippedStartY;
             while (fillY <= clippedEndY) : (fillY += 1) {
                 var fillX = clippedStartX;
@@ -1102,7 +1176,7 @@ pub const OptimizedBuffer = struct {
                     if (tab_x >= self.width) break;
 
                     if (isRGBAWithAlpha(bgColor)) {
-                        self.setCellWithAlphaBlendingCell(
+                        _ = self.setCellWithAlphaBlendingCell(
                             tab_x,
                             y,
                             makeCell(DEFAULT_SPACE_CHAR, fg, bgColor, attributes),
@@ -1125,7 +1199,7 @@ pub const OptimizedBuffer = struct {
             }
 
             if (isRGBAWithAlpha(bgColor)) {
-                self.setCellWithAlphaBlendingCell(
+                _ = self.setCellWithAlphaBlendingCell(
                     charX,
                     y,
                     makeCell(encoded_char, fg, bgColor, attributes),
@@ -1234,7 +1308,7 @@ pub const OptimizedBuffer = struct {
                         if (graphemeId != lastDrawnGraphemeId) {
                             // We haven't drawn the start character for this grapheme (likely out of bounds to the left)
                             // Draw a space with the same attributes to fill the cell
-                            self.setCellWithAlphaBlendingCell(
+                            _ = self.setCellWithAlphaBlendingCell(
                                 @intCast(dX),
                                 @intCast(dY),
                                 makeCell(DEFAULT_SPACE_CHAR, srcFg, srcBg, srcAttr),
@@ -1247,7 +1321,7 @@ pub const OptimizedBuffer = struct {
                         lastDrawnGraphemeId = srcChar & gp.GRAPHEME_ID_MASK;
                     }
 
-                    self.setCellWithAlphaBlendingCell(
+                    _ = self.setCellWithAlphaBlendingCell(
                         @intCast(dX),
                         @intCast(dY),
                         makeCell(srcChar, srcFg, srcBg, srcAttr),
@@ -1633,7 +1707,7 @@ pub const OptimizedBuffer = struct {
                                 }
                             }
 
-                            self.setCellWithAlphaBlendingCell(
+                            _ = self.setCellWithAlphaBlendingCell(
                                 @intCast(currentX + @as(i32, @intCast(tab_col))),
                                 @intCast(currentY),
                                 makeCell(char, fg, drawBg, drawAttributes),
@@ -1665,7 +1739,7 @@ pub const OptimizedBuffer = struct {
                             }
                         }
 
-                        self.setCellWithAlphaBlendingCell(
+                        _ = self.setCellWithAlphaBlendingCell(
                             @intCast(currentX),
                             @intCast(currentY),
                             makeCell(encoded_char, drawFg, drawBg, drawAttributes),
@@ -1959,7 +2033,7 @@ pub const OptimizedBuffer = struct {
                             self.buffer.fg[index] = borderColor;
                             self.buffer.attributes[index] = 0;
                         } else {
-                            self.setCellWithAlphaBlendingCell(
+                            _ = self.setCellWithAlphaBlendingCell(
                                 @intCast(drawX),
                                 @intCast(startY),
                                 makeCell(char, borderColor, backgroundColor, 0),
@@ -1993,7 +2067,7 @@ pub const OptimizedBuffer = struct {
                             self.buffer.fg[index] = borderColor;
                             self.buffer.attributes[index] = 0;
                         } else {
-                            self.setCellWithAlphaBlendingCell(
+                            _ = self.setCellWithAlphaBlendingCell(
                                 @intCast(drawX),
                                 @intCast(endY),
                                 makeCell(char, borderColor, backgroundColor, 0),
@@ -2019,7 +2093,7 @@ pub const OptimizedBuffer = struct {
                         self.buffer.fg[index] = borderColor;
                         self.buffer.attributes[index] = 0;
                     } else {
-                        self.setCellWithAlphaBlendingCell(
+                        _ = self.setCellWithAlphaBlendingCell(
                             @intCast(startX),
                             @intCast(drawY),
                             makeCell(borderChars[@intFromEnum(BorderCharIndex.vertical)], borderColor, backgroundColor, 0),
@@ -2035,7 +2109,7 @@ pub const OptimizedBuffer = struct {
                         self.buffer.fg[index] = borderColor;
                         self.buffer.attributes[index] = 0;
                     } else {
-                        self.setCellWithAlphaBlendingCell(
+                        _ = self.setCellWithAlphaBlendingCell(
                             @intCast(endX),
                             @intCast(drawY),
                             makeCell(borderChars[@intFromEnum(BorderCharIndex.vertical)], borderColor, backgroundColor, 0),
@@ -2270,7 +2344,7 @@ pub const OptimizedBuffer = struct {
                 const fg = applyOpacity(baseFg, opacityToU8(gray * opacity));
 
                 if (graphemeAware or linkAware) {
-                    self.setCellWithAlphaBlendingCell(destX, destY, makeCell(char, fg, bg, 0));
+                    _ = self.setCellWithAlphaBlendingCell(destX, destY, makeCell(char, fg, bg, 0));
                 } else {
                     self.setCellWithAlphaBlendingRawCell(destX, destY, makeCell(char, fg, bg, 0));
                 }
@@ -2352,7 +2426,7 @@ pub const OptimizedBuffer = struct {
                 const fg = applyOpacity(baseFg, opacityToU8(gray * opacity));
 
                 if (graphemeAware or linkAware) {
-                    self.setCellWithAlphaBlendingCell(destX, destY, makeCell(char, fg, bg, 0));
+                    _ = self.setCellWithAlphaBlendingCell(destX, destY, makeCell(char, fg, bg, 0));
                 } else {
                     self.setCellWithAlphaBlendingRawCell(destX, destY, makeCell(char, fg, bg, 0));
                 }

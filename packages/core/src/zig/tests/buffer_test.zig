@@ -1923,7 +1923,7 @@ test "buffer - full covered color emoji becomes exact placeholder cells" {
     const solid_bg = ansi.rgbaFromFloats(0, 0, 0, 1);
     const fg = ansi.rgbaFromFloats(1, 1, 1, 1);
     try buf.drawText("😀", 1, 0, fg, solid_bg, 0);
-    buf.fillRect(1, 0, 2, 1, ansi.rgbaFromFloats(0, 0, 1, 0.5));
+    buf.fillRectClipWideGraphemes(1, 0, 2, 1, ansi.rgbaFromFloats(0, 0, 1, 0.5));
 
     const left = buf.get(1, 0).?;
     const right = buf.get(2, 0).?;

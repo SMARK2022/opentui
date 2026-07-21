@@ -3,6 +3,13 @@ import { BoxRenderable, type BoxOptions } from "./Box.js"
 import { createTestRenderer, type TestRenderer } from "../testing/test-renderer.js"
 import type { BorderStyle } from "../lib/border.js"
 import { RGBA } from "../lib/RGBA.js"
+import type { OptimizedBuffer } from "../buffer.js"
+
+class TestableBoxRenderable extends BoxRenderable {
+  renderSelfForTest(buffer: OptimizedBuffer): void {
+    this.renderSelf(buffer)
+  }
+}
 
 let testRenderer: TestRenderer
 let renderOnce: () => Promise<void>
@@ -371,7 +378,7 @@ describe("BoxRenderable - focus-within", () => {
 
 describe("BoxRenderable - no-op rendering", () => {
   test("skips drawBox for transparent layout-only boxes", () => {
-    const box = new BoxRenderable(testRenderer, {
+    const box = new TestableBoxRenderable(testRenderer, {
       id: "layout-only",
       width: 10,
       height: 5,
@@ -387,12 +394,12 @@ describe("BoxRenderable - no-op rendering", () => {
       fillRect() {},
     }
 
-    ;(box as any).renderSelf(buffer)
+    box.renderSelfForTest(buffer as unknown as OptimizedBuffer)
     expect(called).toBe(false)
   })
 
   test("still draws boxes with a visible fill", () => {
-    const box = new BoxRenderable(testRenderer, {
+    const box = new TestableBoxRenderable(testRenderer, {
       id: "filled-box",
       width: 10,
       height: 5,
@@ -409,12 +416,12 @@ describe("BoxRenderable - no-op rendering", () => {
       fillRect() {},
     }
 
-    ;(box as any).renderSelf(buffer)
+    box.renderSelfForTest(buffer as unknown as OptimizedBuffer)
     expect(called).toBe(true)
   })
 
   test("still draws boxes with borders", () => {
-    const box = new BoxRenderable(testRenderer, {
+    const box = new TestableBoxRenderable(testRenderer, {
       id: "bordered-box",
       width: 10,
       height: 5,
@@ -430,7 +437,7 @@ describe("BoxRenderable - no-op rendering", () => {
       fillRect() {},
     }
 
-    ;(box as any).renderSelf(buffer)
+    box.renderSelfForTest(buffer as unknown as OptimizedBuffer)
     expect(called).toBe(true)
   })
 

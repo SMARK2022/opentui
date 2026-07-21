@@ -1117,6 +1117,12 @@ pub const OptimizedBuffer = struct {
         if (isFullyTransparent(opacity, ansi.rgbColor(0, 0, 0, 0), bg)) return;
         const overlay = makeCell(DEFAULT_SPACE_CHAR, ansi.rgbColor(255, 255, 255, 255), bg, 0);
         if (self.get(x, y)) |dest| {
+            // 彩色emoji的半边不可被边框单独改写；保持整个span让下一帧仍能恢复原始grapheme。
+            if ((gp.isGraphemeChar(dest.char) or gp.isContinuationChar(dest.char)) and
+                self.classifyWideChar(dest.char) == .emoji)
+            {
+                return;
+            }
             self.set(x, y, self.blendCellsWithoutPreservingChar(overlay, dest));
         } else {
             self.set(x, y, overlay);

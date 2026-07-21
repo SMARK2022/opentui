@@ -1888,6 +1888,7 @@ test "OptimizedBuffer - fillRect alpha path preserves underlying text without tr
 test "buffer - raw alpha path preserves wide CJK span without trackers" {
     // setRaw模拟真实framebuffer快路径留下的cell编码，故意不填充tracker来覆盖raw producer。
     // 期望值直接比较start/continuation编码，而不是只比较最终可见字符串。
+    // 这能证明raw producer与普通drawText共享同一个span owner，而不是偶然显示相同。
     const pool = gp.initGlobalPool(std.testing.allocator);
     defer gp.deinitGlobalPool();
 
@@ -1913,6 +1914,7 @@ test "buffer - raw alpha path preserves wide CJK span without trackers" {
 
 test "buffer - full covered color emoji becomes exact placeholder cells" {
     // []合同要求两个独立ASCII cell；只断言宽度会允许单个placeholder或残留continuation蒙混通过。
+    // tracker清空断言保证下一帧恢复emoji时不会读取已经失效的旧grapheme元数据。
     const pool = gp.initGlobalPool(std.testing.allocator);
     defer gp.deinitGlobalPool();
 
@@ -1934,6 +1936,7 @@ test "buffer - full covered color emoji becomes exact placeholder cells" {
 
 test "buffer - clipped wide fill clears only the intersected edge cell" {
     // 该测试区分边缘裁剪和普通fill：外侧cell的背景必须保持原色。
+    // 只覆盖continuation cell模拟Box右边缘穿过CJK宽span的真实几何。
     const pool = gp.initGlobalPool(std.testing.allocator);
     defer gp.deinitGlobalPool();
     var buf = try OptimizedBuffer.init(std.testing.allocator, 6, 1, .{ .pool = pool, .id = "clipped-edge" });
@@ -1946,6 +1949,7 @@ test "buffer - clipped wide fill clears only the intersected edge cell" {
 
     const touched = buf.get(2, 0).?;
     const untouched = buf.get(1, 0).?;
+    // 命中cell被清空但未命中cell背景不变，二者同时成立才算严格裁剪。
     try std.testing.expectEqual(@as(u32, buffer_mod.DEFAULT_SPACE_CHAR), touched.char);
     try std.testing.expectEqual(solid_bg, untouched.bg);
 }

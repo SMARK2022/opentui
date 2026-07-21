@@ -434,6 +434,7 @@ function getOpenTUILib(libPath?: string) {
       returns: "void",
     },
     bufferFillRect: {
+      // 保留普通fill符号，内部区域不能误用边缘裁剪语义。
       args: ["u32", "u32", "u32", "u32", "u32", "ptr"],
       returns: "void",
     },
@@ -3050,6 +3051,7 @@ class FFIRenderLib implements RenderLib {
     // 边缘填充必须通过native scissor/span路径，避免TypeScript层重新推导宽字形。
     // 指针只在同步FFI调用期间有效，不能缓存到下一帧。
     const bg = rgbaPtr(color)
+    // 调用同步完成后native只保留cell结果，不保留这个临时颜色指针。
     this.opentui.symbols.bufferFillRectClipWideGraphemes(buffer, x, y, width, height, bg)
   }
 

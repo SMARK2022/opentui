@@ -752,6 +752,7 @@ pub const OptimizedBuffer = struct {
     }
 
     pub fn blendCells(self: *const OptimizedBuffer, overlayCell: Cell, destCell: Cell) Cell {
+        // 普通alpha合成仍保留底层字符，因为整块fill需要保护未被边界切开的文字。
         const hasBgAlpha = isRGBAWithAlpha(overlayCell.bg);
         const hasFgAlpha = isRGBAWithAlpha(overlayCell.fg);
 
@@ -802,6 +803,7 @@ pub const OptimizedBuffer = struct {
 
     fn blendCellsWithoutPreservingChar(self: *const OptimizedBuffer, overlayCell: Cell, destCell: Cell) Cell {
         // 框线边缘只覆盖一个cell时，必须清掉被切开的宽字形，不能把原字符带到边界外。
+        // 颜色和属性仍沿用同一个blend结果，只有字符字段按裁剪合同置为空格。
         const blended = self.blendCells(overlayCell, destCell);
         return .{ .char = DEFAULT_SPACE_CHAR, .fg = blended.fg, .bg = blended.bg, .attributes = blended.attributes };
     }
@@ -1007,6 +1009,7 @@ pub const OptimizedBuffer = struct {
         height: u32,
         bg: RGBA,
     ) void {
+        // 普通fill是内部区域的唯一语义入口，负责完整span和emoji placeholder处理。
         if (self.width == 0 or self.height == 0 or width == 0 or height == 0) return;
         if (x >= self.width or y >= self.height) return;
 
@@ -1108,6 +1111,7 @@ pub const OptimizedBuffer = struct {
         bg: RGBA,
     ) void {
         // 这里刻意不调用保留原字符的普通setter，因为边框可以只命中宽span的一半。
+        // scissor检查必须在读取目标cell之前完成，防止边界外span被间接改写。
         if (!self.isPointInScissor(@intCast(x), @intCast(y))) return;
         const opacity = self.getCurrentOpacity();
         if (isFullyTransparent(opacity, ansi.rgbColor(0, 0, 0, 0), bg)) return;
@@ -1122,6 +1126,7 @@ pub const OptimizedBuffer = struct {
     /// Apply a translucent edge without tinting a whole grapheme that only touches the edge.
     pub fn fillRectClipWideGraphemes(self: *OptimizedBuffer, x: u32, y: u32, width: u32, height: u32, bg: RGBA) void {
         // 该入口只负责几何边缘；普通fill仍负责内部区域和完整emoji替换合同。
+        // alpha为零时直接返回，避免空边缘带清除正常内容。
         const bounds = self.clippedFillBounds(x, y, width, height) orelse return;
         if (ansi.alpha(bg) == 0 or self.getCurrentOpacity() == 0.0) return;
 

@@ -266,6 +266,7 @@ export class BoxRenderable extends Renderable {
     const screenX = this._screenX
     const screenY = this._screenY
     const clipWideFill = hasBorder && this.shouldFill && this._backgroundColor.a < 1
+    // 不透明边框无需额外边缘通道，原有drawBox的批量路径更直接。
 
     if (clipWideFill) {
       // 只有边缘带需要逐cell裁剪；内部区域使用普通fill保留完整CJK span。
@@ -306,6 +307,7 @@ export class BoxRenderable extends Renderable {
     const fillY = y + top
     if (top) buffer.fillRectClipWideGraphemes(fillX, fillY, width, 1, this._backgroundColor)
     // 上下边是整行带，左右边只覆盖除去角点的中段，避免重复blend。
+    // 角点由边框字符本身绘制，填充带不重复覆盖它们。
     if (bottom && height > 1) buffer.fillRectClipWideGraphemes(fillX, fillY + height - 1, width, 1, this._backgroundColor)
     if (left && height > 2) buffer.fillRectClipWideGraphemes(fillX, fillY + 1, 1, height - 2, this._backgroundColor)
     if (right && width > 1 && height > 2) {

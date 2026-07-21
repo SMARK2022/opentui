@@ -1932,6 +1932,24 @@ test "buffer - full covered color emoji becomes exact placeholder cells" {
     try std.testing.expect(!buf.grapheme_tracker.hasAny());
 }
 
+test "buffer - clipped wide fill clears only the intersected edge cell" {
+    // 该测试区分边缘裁剪和普通fill：外侧cell的背景必须保持原色。
+    const pool = gp.initGlobalPool(std.testing.allocator);
+    defer gp.deinitGlobalPool();
+    var buf = try OptimizedBuffer.init(std.testing.allocator, 6, 1, .{ .pool = pool, .id = "clipped-edge" });
+    defer buf.deinit();
+
+    const solid_bg = ansi.rgbaFromFloats(0, 0, 0, 1);
+    const fg = ansi.rgbaFromFloats(1, 1, 1, 1);
+    try buf.drawText("中", 1, 0, fg, solid_bg, 0);
+    buf.fillRectClipWideGraphemes(2, 0, 1, 1, ansi.rgbaFromFloats(0, 0, 1, 0.5));
+
+    const touched = buf.get(2, 0).?;
+    const untouched = buf.get(1, 0).?;
+    try std.testing.expectEqual(@as(u32, buffer_mod.DEFAULT_SPACE_CHAR), touched.char);
+    try std.testing.expectEqual(solid_bg, untouched.bg);
+}
+
 test "buffer - clipped half emoji preserves the original span" {
     // scissor只可写入可见cell，半覆盖不能越界重写另一半span，因此应保留原始emoji编码。
     const pool = gp.initGlobalPool(std.testing.allocator);

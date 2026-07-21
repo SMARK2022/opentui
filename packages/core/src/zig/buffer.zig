@@ -800,6 +800,12 @@ pub const OptimizedBuffer = struct {
         return overlayCell;
     }
 
+    fn blendCellsWithoutPreservingChar(self: *const OptimizedBuffer, overlayCell: Cell, destCell: Cell) Cell {
+        // 框线边缘只覆盖一个cell时，必须清掉被切开的宽字形，不能把原字符带到边界外。
+        const blended = self.blendCells(overlayCell, destCell);
+        return .{ .char = DEFAULT_SPACE_CHAR, .fg = blended.fg, .bg = blended.bg, .attributes = blended.attributes };
+    }
+
     fn classifyWideChar(self: *const OptimizedBuffer, char: u32) WideCharKind {
         // 组合emoji不能用单个codepoint宽度判断；先读首codepoint，再检查ZWJ/变体选择器。
         // 这条判断只影响完整span覆盖时的可见placeholder，不改变终端的普通宽度计算。
@@ -1067,6 +1073,64 @@ pub const OptimizedBuffer = struct {
                 @memset(rowSliceFg, ansi.rgbColor(255, 255, 255, 255));
                 @memset(rowSliceBg, bg);
                 @memset(rowSliceAttrs, 0);
+            }
+        }
+    }
+
+    fn clippedFillBounds(self: *const OptimizedBuffer, x: u32, y: u32, width: u32, height: u32) ?struct {
+        start_x: u32,
+        start_y: u32,
+        end_x: u32,
+        end_y: u32,
+    } {
+        // 先按buffer边界裁剪，再按当前scissor裁剪，避免边缘带访问越界cell。
+        if (self.width == 0 or self.height == 0 or width == 0 or height == 0) return null;
+        if (x >= self.width or y >= self.height) return null;
+        if (!self.isRectInScissor(@intCast(x), @intCast(y), width, height)) return null;
+
+        const requested_end_x = x + width - 1;
+        const requested_end_y = y + height - 1;
+        const end_x = @min(self.width - 1, requested_end_x);
+        const end_y = @min(self.height - 1, requested_end_y);
+        const clipped = self.clipRectToScissor(@intCast(x), @intCast(y), end_x - x + 1, end_y - y + 1) orelse return null;
+        return .{
+            .start_x = @max(x, @as(u32, @intCast(clipped.x))),
+            .start_y = @max(y, @as(u32, @intCast(clipped.y))),
+            .end_x = @min(end_x, @as(u32, @intCast(clipped.x + @as(i32, @intCast(clipped.width)) - 1))),
+            .end_y = @min(end_y, @as(u32, @intCast(clipped.y + @as(i32, @intCast(clipped.height)) - 1))),
+        };
+    }
+
+    fn setCellWithAlphaBlendingClipWideGraphemes(
+        self: *OptimizedBuffer,
+        x: u32,
+        y: u32,
+        bg: RGBA,
+    ) void {
+        // 这里刻意不调用保留原字符的普通setter，因为边框可以只命中宽span的一半。
+        if (!self.isPointInScissor(@intCast(x), @intCast(y))) return;
+        const opacity = self.getCurrentOpacity();
+        if (isFullyTransparent(opacity, ansi.rgbColor(0, 0, 0, 0), bg)) return;
+        const overlay = makeCell(DEFAULT_SPACE_CHAR, ansi.rgbColor(255, 255, 255, 255), bg, 0);
+        if (self.get(x, y)) |dest| {
+            self.set(x, y, self.blendCellsWithoutPreservingChar(overlay, dest));
+        } else {
+            self.set(x, y, overlay);
+        }
+    }
+
+    /// Apply a translucent edge without tinting a whole grapheme that only touches the edge.
+    pub fn fillRectClipWideGraphemes(self: *OptimizedBuffer, x: u32, y: u32, width: u32, height: u32, bg: RGBA) void {
+        // 该入口只负责几何边缘；普通fill仍负责内部区域和完整emoji替换合同。
+        const bounds = self.clippedFillBounds(x, y, width, height) orelse return;
+        if (ansi.alpha(bg) == 0 or self.getCurrentOpacity() == 0.0) return;
+
+        var fill_y = bounds.start_y;
+        while (fill_y <= bounds.end_y) : (fill_y += 1) {
+            // 每个cell独立清除，防止一个半透明边缘把相邻continuation cell一起染色。
+            var fill_x = bounds.start_x;
+            while (fill_x <= bounds.end_x) : (fill_x += 1) {
+                self.setCellWithAlphaBlendingClipWideGraphemes(fill_x, fill_y, bg);
             }
         }
     }

@@ -382,6 +382,9 @@ describe("BoxRenderable - no-op rendering", () => {
       drawBox() {
         called = true
       },
+      // 测试替身实现完整的Buffer边缘接口，避免把Box路径误判成drawBox-only。
+      fillRectClipWideGraphemes() {},
+      fillRect() {},
     }
 
     ;(box as any).renderSelf(buffer)
@@ -401,6 +404,9 @@ describe("BoxRenderable - no-op rendering", () => {
       drawBox() {
         called = true
       },
+      // bordered Box会先走边缘带，再验证原有drawBox调用仍然存在。
+      fillRectClipWideGraphemes() {},
+      fillRect() {},
     }
 
     ;(box as any).renderSelf(buffer)
@@ -420,6 +426,8 @@ describe("BoxRenderable - no-op rendering", () => {
       drawBox() {
         called = true
       },
+      fillRectClipWideGraphemes() {},
+      fillRect() {},
     }
 
     ;(box as any).renderSelf(buffer)

@@ -437,6 +437,11 @@ function getOpenTUILib(libPath?: string) {
       args: ["u32", "u32", "u32", "u32", "u32", "ptr"],
       returns: "void",
     },
+    bufferFillRectClipWideGraphemes: {
+      // Native symbol is mandatory; missing it must fail library initialization rather than silently change semantics.
+      args: ["u32", "u32", "u32", "u32", "u32", "ptr"],
+      returns: "void",
+    },
     bufferColorMatrix: {
       args: ["u32", "ptr", "ptr", "u32", "f32", "u8"],
       returns: "void",
@@ -2054,6 +2059,14 @@ export interface RenderLib extends AudioEngineLib {
     height: number,
     color: RGBA,
   ) => void
+  bufferFillRectClipWideGraphemes: (
+    buffer: OptimizedBufferHandle,
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+    color: RGBA,
+  ) => void
   bufferColorMatrix: (
     buffer: OptimizedBufferHandle,
     matrixPtr: Pointer,
@@ -3031,6 +3044,13 @@ class FFIRenderLib implements RenderLib {
   public bufferFillRect(buffer: Pointer, x: number, y: number, width: number, height: number, color: RGBA) {
     const bg = rgbaPtr(color)
     this.opentui.symbols.bufferFillRect(buffer, x, y, width, height, bg)
+  }
+
+  public bufferFillRectClipWideGraphemes(buffer: Pointer, x: number, y: number, width: number, height: number, color: RGBA) {
+    // 边缘填充必须通过native scissor/span路径，避免TypeScript层重新推导宽字形。
+    // 指针只在同步FFI调用期间有效，不能缓存到下一帧。
+    const bg = rgbaPtr(color)
+    this.opentui.symbols.bufferFillRectClipWideGraphemes(buffer, x, y, width, height, bg)
   }
 
   public bufferColorMatrix(

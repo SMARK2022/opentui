@@ -1116,6 +1116,12 @@ export fn bufferFillRect(buffer_handle: NativeHandle, x: u32, y: u32, width: u32
     object_ptr.fillRect(x, y, width, height, ptrToRGBA(bg));
 }
 
+export fn bufferFillRectClipWideGraphemes(buffer_handle: NativeHandle, x: u32, y: u32, width: u32, height: u32, bg: [*]const u16) void {
+    // FFI只转发坐标和颜色；scissor、宽span和alpha所有权仍由OptimizedBuffer负责。
+    const object_ptr = acquireBuffer(buffer_handle) orelse return;
+    object_ptr.fillRectClipWideGraphemes(x, y, width, height, ptrToRGBA(bg));
+}
+
 export fn bufferColorMatrix(buffer_handle: NativeHandle, matrixPtr: [*]const f32, cellMaskPtr: [*]const f32, cellMaskCount: u32, strength: f32, target: u8) void {
     const object_ptr = acquireBuffer(buffer_handle) orelse return;
     if (cellMaskCount == 0) return;

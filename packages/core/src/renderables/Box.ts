@@ -265,6 +265,13 @@ export class BoxRenderable extends Renderable {
     const currentBorderColor = hasFocusWithin ? this._focusedBorderColor : this._borderColor
     const screenX = this._screenX
     const screenY = this._screenY
+    const clipWideFill = hasBorder && this.shouldFill && this._backgroundColor.a < 1
+
+    if (clipWideFill) {
+      // 只有边缘带需要逐cell裁剪；内部区域使用普通fill保留完整CJK span。
+      // drawBox仍负责边框字符和标题，避免Box在TypeScript层复制native绘制逻辑。
+      this.renderClippedWideFill(buffer, screenX, screenY)
+    }
 
     buffer.drawBox({
       x: screenX,
@@ -276,13 +283,37 @@ export class BoxRenderable extends Renderable {
       border: this._border,
       borderColor: currentBorderColor,
       backgroundColor: this._backgroundColor,
-      shouldFill: this.shouldFill,
+      shouldFill: this.shouldFill && !clipWideFill,
       title: this._title,
       titleColor: this._titleColor ?? currentBorderColor,
       titleAlignment: this._titleAlignment,
       bottomTitle: this._bottomTitle,
       bottomTitleAlignment: this._bottomTitleAlignment,
     })
+  }
+
+  private renderClippedWideFill(buffer: OptimizedBuffer, x: number, y: number): void {
+    // 这些inset与getScissorRect保持同一边框几何，确保边框不侵入内容区域。
+    const left = this.borderSides.left ? 1 : 0
+    const right = this.borderSides.right ? 1 : 0
+    const top = this.borderSides.top ? 1 : 0
+    const bottom = this.borderSides.bottom ? 1 : 0
+    const width = this.width - left - right
+    const height = this.height - top - bottom
+    if (width <= 0 || height <= 0) return
+
+    const fillX = x + left
+    const fillY = y + top
+    if (top) buffer.fillRectClipWideGraphemes(fillX, fillY, width, 1, this._backgroundColor)
+    // 上下边是整行带，左右边只覆盖除去角点的中段，避免重复blend。
+    if (bottom && height > 1) buffer.fillRectClipWideGraphemes(fillX, fillY + height - 1, width, 1, this._backgroundColor)
+    if (left && height > 2) buffer.fillRectClipWideGraphemes(fillX, fillY + 1, 1, height - 2, this._backgroundColor)
+    if (right && width > 1 && height > 2) {
+      buffer.fillRectClipWideGraphemes(fillX + width - 1, fillY + 1, 1, height - 2, this._backgroundColor)
+    }
+    if (width > 2 && height > 2) {
+      buffer.fillRect(fillX + 1, fillY + 1, width - 2, height - 2, this._backgroundColor)
+    }
   }
 
   protected getScissorRect(): { x: number; y: number; width: number; height: number } {

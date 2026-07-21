@@ -297,6 +297,13 @@ export class OptimizedBuffer {
     this.lib.bufferFillRect(this.bufferPtr, x, y, width, height, bg)
   }
 
+  public fillRectClipWideGraphemes(x: number, y: number, width: number, height: number, bg: RGBA): void {
+    // 仅用于Box的边缘带；内部区域仍使用普通fill以保留完整CJK span。
+    // 这个分界避免把“几何裁剪”和“文本span合成”混成两个竞争实现。
+    this.guard()
+    this.lib.bufferFillRectClipWideGraphemes(this.bufferPtr, x, y, width, height, bg)
+  }
+
   public colorMatrix(
     matrix: Float32Array,
     cellMask: Float32Array,

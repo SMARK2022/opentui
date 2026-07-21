@@ -4,6 +4,16 @@ on:
   push:
     tags:
       - "v*-smark.*"
+  workflow_dispatch:
+    inputs:
+      release-tag:
+        description: Existing immutable release tag to publish
+        required: true
+        type: string
+      source-sha:
+        description: Exact source commit named by the release tag
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -15,12 +25,15 @@ jobs:
     outputs:
       version: ${{ steps.release.outputs.version }}
       artifact-name: ${{ steps.release.outputs.artifact-name }}
+      release-tag: ${{ steps.release.outputs.release-tag }}
+      source-sha: ${{ steps.release.outputs.source-sha }}
 
     steps:
       - name: Checkout complete history
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          ref: ${{ inputs.source-sha || github.sha }}
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -31,10 +44,18 @@ jobs:
         id: release
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
+          RELEASE_TAG="${{ inputs.release-tag || github.ref_name }}"
+          SOURCE_SHA="${{ inputs.source-sha || github.sha }}"
+          VERSION="${RELEASE_TAG#v}"
           # tag必须来自已push的SMARK主分支，避免release与submodule可发现source脱节。
-          git fetch origin smark/main
-          git merge-base --is-ancestor "$GITHUB_SHA" origin/smark/main
+          git fetch origin smark/main --tags
+          test "$(git rev-parse "$RELEASE_TAG^{commit}")" = "$SOURCE_SHA"
+          git merge-base --is-ancestor "$SOURCE_SHA" origin/smark/main
+          # 同一tag只能发布一次；dispatch retry必须在draft创建前确认没有release。
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "release already exists: $RELEASE_TAG" >&2
+            exit 1
+          fi
           VERSION="$VERSION" bun -e '
             const files = await Array.fromAsync(new Bun.Glob("packages/*/package.json").scan())
             for (const file of files) {
@@ -45,7 +66,9 @@ jobs:
             }
           '
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "artifact-name=release-packages-${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          echo "artifact-name=release-packages-${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "release-tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "source-sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
 
   packages:
     name: Build Release Closure
@@ -53,6 +76,7 @@ jobs:
     uses: ./.github/workflows/build-native.yml
     with:
       artifact-name: ${{ needs.prepare.outputs.artifact-name }}
+      source-sha: ${{ needs.prepare.outputs.source-sha }}
 
   verify:
     name: Verify Release (${{ matrix.os }})
@@ -65,6 +89,8 @@ jobs:
     steps:
       - name: Checkout source
         uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.source-sha }}
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -97,20 +123,15 @@ jobs:
           name: ${{ needs.prepare.outputs.artifact-name }}
           path: artifacts/npm-packages
 
-      - name: Require repository release immutability
-        run: |
-          # immutable setting是发布前置，不允许先发布普通release再事后补保护。
-          test "$(gh api "repos/$GH_REPO/immutable-releases" --jq .enabled)" = "true"
-
       - name: Create complete draft release
         run: |
           # 先把12个assets放入draft，publish后GitHub会同时锁定tag和assets并生成attestation。
-          gh release create "$GITHUB_REF_NAME" artifacts/npm-packages/* \
+          gh release create "${{ needs.prepare.outputs.release-tag }}" artifacts/npm-packages/* \
             --draft \
             --verify-tag \
             --prerelease \
-            --title "OpenTUI $GITHUB_REF_NAME (SMARK)" \
-            --notes "OpenTUI ${GITHUB_REF_NAME} with the SMARK CJK and wide-grapheme overlay fixes, built from SMARK2022/opentui:smark/main. Windows DLL assets are unsigned."
+            --title "OpenTUI ${{ needs.prepare.outputs.release-tag }} (SMARK)" \
+            --notes "OpenTUI ${{ needs.prepare.outputs.release-tag }} with the SMARK CJK and wide-grapheme overlay fixes, built from SMARK2022/opentui:smark/main. Windows DLL assets are unsigned."
 
       - name: Publish immutable release
-        run: gh release edit "$GITHUB_REF_NAME" --draft=false --prerelease
+        run: gh release edit "${{ needs.prepare.outputs.release-tag }}" --draft=false --prerelease

@@ -7,6 +7,10 @@ on:
         description: Artifact name shared with caller verification jobs
         required: true
         type: string
+      source-sha:
+        description: Exact OpenTUI source commit used for release builds
+        required: false
+        type: string
     outputs:
       version:
         description: Version read from the lockstep package manifests
@@ -30,6 +34,9 @@ jobs:
     steps:
       - name: Checkout source
         uses: actions/checkout@v6
+        with:
+          # release dispatch来自修复后的workflow分支，但package必须固定到已验证tag source。
+          ref: ${{ inputs.source-sha || github.sha }}
 
       - name: Setup Node
         uses: actions/setup-node@v6

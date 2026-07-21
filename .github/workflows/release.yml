@@ -110,7 +110,7 @@ jobs:
             --verify-tag \
             --prerelease \
             --title "OpenTUI $GITHUB_REF_NAME (SMARK)" \
-            --notes "OpenTUI v0.4.3 with anomalyco/opentui#845, built from SMARK2022/opentui:smark/main. Windows DLL assets are unsigned."
+            --notes "OpenTUI ${GITHUB_REF_NAME} with the SMARK CJK and wide-grapheme overlay fixes, built from SMARK2022/opentui:smark/main. Windows DLL assets are unsigned."
 
       - name: Publish immutable release
         run: gh release edit "$GITHUB_REF_NAME" --draft=false --prerelease

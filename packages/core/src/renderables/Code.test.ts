@@ -1761,16 +1761,19 @@ test("CodeRenderable - settles a closed Markdown prefix without reparsing the fu
       super({ dataPath: "/tmp/mock" }, { autoStartWorker: false })
     }
 
-    override highlightOnce(content: string, _filetype: string, signal?: AbortSignal): Promise<{ highlights: SimpleHighlight[] }> {
+    override highlightOnce(
+      content: string,
+      _filetype: string,
+      signal?: AbortSignal,
+    ): Promise<{ highlights: SimpleHighlight[] }> {
       const delay = content.length >= 150 ? 1000 : 20
       return new Promise((resolve, reject) => {
         const timeout = setTimeout(() => {
           signal?.removeEventListener("abort", abort)
-          const highlights = Array.from(content.matchAll(/const/g), (match) => [
-            match.index!,
-            match.index! + match[0].length,
-            "keyword",
-          ] as SimpleHighlight)
+          const highlights = Array.from(
+            content.matchAll(/const/g),
+            (match) => [match.index!, match.index! + match[0].length, "keyword"] as SimpleHighlight,
+          )
           resolve({ highlights })
         }, delay)
         const abort = () => {
@@ -1808,7 +1811,131 @@ test("CodeRenderable - settles a closed Markdown prefix without reparsing the fu
   expect(codeRenderable.plainText).toContain("const second = 2;")
 })
 
+test("CodeRenderable - defers tiny open-fence appends until the batch threshold", async () => {
+  // 该测试观察公共 highlightingDone 和最终 plainText，不依赖私有 cache 字段或 worker调用次数。
+  const syntaxStyle = SyntaxStyle.fromStyles({
+    default: { fg: RGBA.fromValues(1, 1, 1, 1) },
+  })
+
+  class DeferredFenceClient extends MockTreeSitterClient {
+    private _nextHighlight?: (result: { highlights: SimpleHighlight[] }) => void
+
+    override highlightOnce(content: string, filetype: string, signal?: AbortSignal) {
+      if (content.length < 100) return super.highlightOnce(content, filetype, signal)
+      return new Promise<{ highlights: SimpleHighlight[] }>((resolve) => {
+        this._nextHighlight = resolve
+      })
+    }
+
+    resolveNextHighlight() {
+      this._nextHighlight?.({ highlights: [] })
+      this._nextHighlight = undefined
+    }
+
+    override isHighlighting() {
+      return this._nextHighlight !== undefined || super.isHighlighting()
+    }
+  }
+
+  const client = new DeferredFenceClient()
+  const initial = "```ts\n" + "const value = 1;\n".repeat(6)
+  const codeRenderable = new CodeRenderable(currentRenderer, {
+    id: "test-open-fence-batch",
+    content: initial,
+    filetype: "markdown",
+    syntaxStyle,
+    treeSitterClient: client,
+    streaming: true,
+    drawUnstyledText: false,
+  })
+
+  currentRenderer.root.add(codeRenderable)
+  // 初次open fence仍需完整解析，后续门槛只能建立在已有正确frame之上。
+  await renderOnce()
+  client.resolveNextHighlight()
+  await waitForHighlight(codeRenderable)
+
+  let settled = false
+  codeRenderable.highlightingDone.then(() => {
+    settled = true
+  })
+  codeRenderable.content = initial + "const tiny = true;\n"
+  await renderOnce()
+  await flushAsync()
+
+  // 未达到门槛时保留最近正确frame，避免 drawUnstyledText=false的消费者看到伪高亮结果。
+  expect(settled).toBe(true)
+  expect(client.isHighlighting()).toBe(false)
+  // deferred frame不承诺新增字符已经着色，只承诺不会提交错误的半解析结果。
+  // 这保留了drawUnstyledText=false路径的既有可见性，而不是引入raw text fallback。
+  expect(codeRenderable.plainText).toBe(initial)
+
+  codeRenderable.content = initial + "const tiny = true;\n" + "const threshold = true;\n".repeat(32)
+  await renderOnce()
+  await flushAsync()
+
+  // 跨过32行后必须重新进入同一full-context解析路径，而不是永久冻结dirty状态。
+  expect(client.isHighlighting()).toBe(true)
+  // 阈值跨越必须恢复dirty continuation，否则小append的保护会变成永久停滞。
+  // 测试通过公共client promise释放解析，避免绑定Code的内部cache表示。
+  client.resolveNextHighlight()
+  // completion后dirty必须清除，避免下一帧重复提交同一个threshold snapshot。
+  await waitForHighlight(codeRenderable)
+})
+
+test("CodeRenderable - keeps an active Markdown request across append-only updates", async () => {
+  // append-only更新只推进latest dirty；旧请求完成后不能执行旧snapshot callback。
+  const syntaxStyle = SyntaxStyle.fromStyles({
+    default: { fg: RGBA.fromValues(1, 1, 1, 1) },
+  })
+  const client = new MockTreeSitterClient()
+  const initial = "# First\n\n"
+  const latest = initial + "Second paragraph.\n\n"
+  const observedContents: string[] = []
+  const codeRenderable = new CodeRenderable(currentRenderer, {
+    id: "test-markdown-active-append",
+    content: initial,
+    filetype: "markdown",
+    syntaxStyle,
+    treeSitterClient: client,
+    streaming: true,
+    drawUnstyledText: false,
+    onHighlight: (highlights, context) => {
+      observedContents.push(context.content)
+      return highlights
+    },
+  })
+
+  currentRenderer.root.add(codeRenderable)
+  // 首个请求故意保持pending，用来观察append是否错误触发semantic abort。
+  await renderOnce()
+  expect(client.isHighlighting()).toBe(true)
+
+  codeRenderable.content = latest
+  await flushAsync()
+  // active worker仍在工作，证明正常delta没有走semantic termination路径。
+  // 如果setter错误地abort，mock会移除pending promise，这个公共状态会立即变成false。
+  expect(client.isHighlighting()).toBe(true)
+
+  client.resolveHighlightOnce()
+  // 旧结果完成后只允许latest snapshot继续执行公开callback。
+  await waitForHighlight(codeRenderable)
+  await renderOnce()
+  client.resolveAllHighlightOnce()
+  // replay后的latest结果通过同一公共promise完成，不要求测试知道内部job结构。
+  await waitForHighlight(codeRenderable)
+  await renderOnce()
+
+  expect(codeRenderable.content).toBe(latest)
+  expect(codeRenderable.plainText).toBe(latest)
+  // 只有latest snapshot可以触发公开onHighlight语义。
+  // stale raw cache可以内部复用，但旧snapshot不能泄漏到公开callback上下文。
+  // 该断言同时保护latest dirty的callback顺序和旧结果抑制边界。
+  expect(observedContents).toEqual([latest])
+})
+
 test("CodeRenderable - streaming Markdown matches a full parse across tables, fences and formulas", async () => {
+  // 逐delta结果必须与独立full parse相同，尤其验证伪closer不会提前冻结stable prefix。
   const syntaxStyle = SyntaxStyle.fromStyles({
     default: { fg: RGBA.fromValues(1, 1, 1, 1) },
   })
@@ -1820,6 +1947,7 @@ test("CodeRenderable - streaming Markdown matches a full parse across tables, fe
     "[foo]: https://example.com\n\n",
     "```ts\n",
     "const value = 1;\n",
+    "```not-a-closing-marker\n",
     "```\n\n",
     "Inline $$a\nb$$\n",
   ]
@@ -1852,9 +1980,11 @@ test("CodeRenderable - streaming Markdown matches a full parse across tables, fe
     }
 
     const expected = await client.highlightOnce(content, "markdown")
+    // independent client full parse是结构正确性的oracle，不复制Code的cache算法。
     expect(latestHighlights).toEqual(expected.highlights ?? [])
     expect(codeRenderable.plainText).toContain("| alpha | $x$ |")
     expect(codeRenderable.plainText).toContain("const value = 1;")
+    expect(codeRenderable.plainText).toContain("```not-a-closing-marker")
     expect(codeRenderable.plainText).toContain("Inline $$a\nb$$")
   } finally {
     await client.destroy()

@@ -50,10 +50,31 @@ type HighlightSnapshot = {
 }
 
 type MarkdownHighlightCache = {
+  // `content` 是最近真正解析的快照；boundary 可以领先到尚未解析的最新 append。
+  // 两者分离后，deferred 状态不会把旧 highlights 冒充成新结果。
   content: string
   cut: number
   frontmatterState: number
   highlights: SimpleHighlight[]
+  boundary: MarkdownBoundaryState
+  parsedLength: number
+  parsedLines: number
+  parsedFenceStart?: number
+}
+
+type MarkdownBoundaryState = {
+  // scanOffset 指向最后一个未闭合行的起点，下一次 append 只重扫该行和新增后缀。
+  // lineCount 只统计完整行，partial closer 不得提前解除 deferred 状态。
+  contentLength: number
+  scanOffset: number
+  lineCount: number
+  lastSafe: number
+  referenceBlocked: boolean
+  frontmatterMarker?: "---" | "+++"
+  frontmatterEnd?: number
+  openFenceStart?: number
+  fenceMarker?: string
+  fenceRollback?: number
 }
 
 type MarkdownHighlightResult = {
@@ -76,6 +97,11 @@ export interface CodeOptions extends TextBufferOptions {
 }
 
 type ConcealLineRange = [start: number, end: number]
+
+const OPEN_FENCE_BATCH_LINES = 32
+const OPEN_FENCE_BATCH_CHARS = 4096
+// 两个门槛取先到者：短行代码受字符上限保护，普通代码则每32行校正一次完整语义。
+// 不使用定时器，避免空闲帧反复唤醒；fence closure和语义变更仍会立即绕过批量门槛。
 
 export class CodeRenderable extends TextBufferRenderable {
   private _content: string
@@ -144,8 +170,14 @@ export class CodeRenderable extends TextBufferRenderable {
   set content(value: string) {
     if (this._content !== value) {
       const appendOnly = value.startsWith(this._content)
+      const coalesceAppend = appendOnly && this._streaming && this._filetype === "markdown"
       this._content = value
-      this.invalidateHighlight(appendOnly)
+      if (coalesceAppend && this._markdownHighlightCache) {
+        // 边界游标只消费新增后缀，避免长 fence 每个 delta 都同步扫描全部历史。
+        // rewrite 不会进入这里，因此复用的 cursor 必然仍对应同一份 Markdown 前缀。
+        this._markdownHighlightCache.boundary = advanceMarkdownBoundary(value, this._markdownHighlightCache.boundary)
+      }
+      this.invalidateHighlight(appendOnly, !coalesceAppend)
 
       if (this._streaming && this._filetype && !this._drawUnstyledText) {
         return
@@ -316,14 +348,17 @@ export class CodeRenderable extends TextBufferRenderable {
     return this._highlightingPromise
   }
 
-  private invalidateHighlight(preserveMarkdownCache = false): void {
+  private invalidateHighlight(preserveMarkdownCache = false, abortActive = true): void {
     this._highlightUnavailable = false
     this._highlightsDirty = true
     this._highlightSnapshotId++
+    // snapshot id始终递增，保证deferred期间到达的setter仍会让旧callback失效。
+    // 只有可证明的Markdown prefix append才允许跳过abort；其余变更必须立即释放旧worker。
     if (!preserveMarkdownCache) {
+      // semantic rewrite清除boundary cursor，防止旧文档的line offset被新文档误用。
       this._markdownHighlightCache = undefined
     }
-    this._highlightAbortController?.abort()
+    if (abortActive) this._highlightAbortController?.abort()
     this.requestRender()
   }
 
@@ -402,12 +437,19 @@ export class CodeRenderable extends TextBufferRenderable {
     this._highlightAbortController = abortController
 
     try {
-      const markdownResult = snapshot.streaming && snapshot.filetype === "markdown"
-        ? await this.highlightMarkdown(snapshot, abortController.signal)
-        : undefined
+      const markdownResult =
+        snapshot.streaming && snapshot.filetype === "markdown"
+          ? await this.highlightMarkdown(snapshot, abortController.signal)
+          : undefined
       const result = markdownResult ?? (await this.highlightWithAbort(snapshot, abortController.signal))
 
       if (!this.isCurrentSnapshot(snapshot)) {
+        if (markdownResult && this.canSeedMarkdownCache(snapshot)) {
+          // 旧快照只预热 raw cache；可见提交和 callbacks 仍由最新快照独占。
+          // 先把 boundary 推到当前文本，finally 才能判断应立即追赶还是进入 deferred 状态。
+          markdownResult.cache.boundary = advanceMarkdownBoundary(this._content, markdownResult.cache.boundary)
+          this._markdownHighlightCache = markdownResult.cache
+        }
         this.requestRender()
         return
       }
@@ -540,12 +582,19 @@ export class CodeRenderable extends TextBufferRenderable {
     const content = snapshot.content
     const frontmatterState = getFrontmatterState(content)
     const previous = this._markdownHighlightCache
+    // boundary先于cache cut计算，确保reference/fence状态不会因复用旧stable prefix而倒退。
+    // 只有严格prefix且frontmatter语义一致时，历史highlights才有资格继续参与结果。
+    const boundary = advanceMarkdownBoundary(content, previous?.boundary)
+    const cut = markdownBoundaryCut(boundary)
     const canReuse =
-      previous && content.startsWith(previous.content) && previous.frontmatterState === frontmatterState && stablePrefixEnd(content) >= previous.cut
+      // stable prefix只有在frontmatter和文本prefix同时兼容时才可复用。
+      previous &&
+      content.startsWith(previous.content) &&
+      previous.frontmatterState === frontmatterState &&
+      cut >= previous.cut
 
     let cachedCut = canReuse ? previous.cut : 0
     let cachedHighlights = canReuse ? previous.highlights : []
-    const cut = stablePrefixEnd(content)
 
     if (cut > cachedCut) {
       const segment = await this.highlightMarkdownFragment(snapshot, signal, content.slice(cachedCut, cut))
@@ -554,6 +603,7 @@ export class CodeRenderable extends TextBufferRenderable {
     }
 
     const tail = content.slice(cachedCut)
+    // tail始终保留完整上下文；只有boundary cut对应的closed prefix才允许单独复用。
     const tailHighlights = tail.length === 0 ? [] : await this.highlightMarkdownFragment(snapshot, signal, tail)
 
     return {
@@ -563,8 +613,47 @@ export class CodeRenderable extends TextBufferRenderable {
         cut: cachedCut,
         frontmatterState,
         highlights: cachedHighlights,
+        boundary,
+        parsedLength: content.length,
+        parsedLines: boundary.lineCount,
+        parsedFenceStart: boundary.openFenceStart,
       },
     }
+  }
+
+  private canSeedMarkdownCache(snapshot: HighlightSnapshot): boolean {
+    // raw highlight cache 仍受全部可见语义输入约束，避免样式或 callback更新后复用旧快照。
+    // content 必须保持严格前缀关系；rewrite 的旧结果只能丢弃，不能成为新的 cache 起点。
+    return (
+      this._streaming &&
+      this._filetype === "markdown" &&
+      this._content.startsWith(snapshot.content) &&
+      this._treeSitterClient === snapshot.treeSitterClient &&
+      this._syntaxStyle === snapshot.syntaxStyle &&
+      this._conceal === snapshot.conceal &&
+      this._drawUnstyledText === snapshot.drawUnstyledText &&
+      this._baseHighlight === snapshot.baseHighlight &&
+      this._onHighlight === snapshot.onHighlight &&
+      this._onChunks === snapshot.onChunks
+    )
+  }
+
+  private shouldDeferMarkdownHighlight(): boolean {
+    // cache缺失时必须正常解析，不能让新的Markdown文档继承未知的deferred状态。
+    const cache = this._markdownHighlightCache
+    if (!cache || !this._streaming || this._filetype !== "markdown") return false
+    if (!this._content.startsWith(cache.content)) return false
+    // cache.content是最近一次真实解析的快照，任何rewrite都必须退出deferred路径。
+
+    const boundary = cache.boundary
+    if (boundary.openFenceStart === undefined || boundary.openFenceStart !== cache.parsedFenceStart) return false
+
+    // dirty 状态继续保留；只有阈值或合法 closer 到达才重新进入同一 full-context 主路径。
+    // parsedFenceStart 必须相同，否则新 opener需要立即解析，不能借前一个 fence的预算延迟。
+    return (
+      boundary.lineCount - cache.parsedLines < OPEN_FENCE_BATCH_LINES &&
+      this._content.length - cache.parsedLength < OPEN_FENCE_BATCH_CHARS
+    )
   }
 
   private async highlightMarkdownFragment(snapshot: HighlightSnapshot, signal: AbortSignal, content: string) {
@@ -692,6 +781,8 @@ export class CodeRenderable extends TextBufferRenderable {
 
   private startDirtyHighlight(): void {
     if (this.isDestroyed || this._isHighlighting || this._highlightUnavailable || !this._highlightsDirty) return
+    // deferred返回时刻意不清除dirty；下一次append、closure或semantic setter仍能触发同一入口。
+    if (this.shouldDeferMarkdownHighlight()) return
 
     if (this._content.length === 0) {
       this._shouldRenderTextBuffer = false
@@ -739,62 +830,91 @@ function clipHighlights(highlights: SimpleHighlight[], length: number): SimpleHi
   })
 }
 
-function stablePrefixEnd(content: string): number {
-  const lines = content.split("\n")
-  let offset = 0
-  let lastSafe = 0
-  let openFence = false
-  let fenceMarker = ""
+function advanceMarkdownBoundary(content: string, previous?: MarkdownBoundaryState): MarkdownBoundaryState {
+  // 只有 append-only caller会传入previous；长度回退时重建完整状态，避免复用错误cursor。
+  // 浅拷贝保护已完成parse的快照，后续append只能推进当前边界状态。
+  const state =
+    previous && previous.contentLength <= content.length
+      ? { ...previous }
+      : {
+          contentLength: 0,
+          scanOffset: 0,
+          lineCount: 0,
+          lastSafe: 0,
+          referenceBlocked: false,
+        }
 
-  for (let index = 0; index < lines.length; index++) {
-    const line = lines[index]
-    const lineStart = offset
-    offset += line.length + 1
+  let lineStart = state.scanOffset
+  // indexOf从cursor开始，保证长代码的同步边界成本只随新增suffix增长。
+  for (let newline = content.indexOf("\n", lineStart); newline !== -1; newline = content.indexOf("\n", lineStart)) {
+    // 只处理完整行；最后的partial line留给下次append，与closer的整行合同一致。
+    const line = content.slice(lineStart, newline)
     const trimmed = line.trim()
-    const fenceMatch = trimmed.match(/^(`{3,}|~{3,})/)
 
-    if (openFence) {
-      if (fenceMatch && fenceMatch[1][0] === fenceMarker[0] && fenceMatch[1].length >= fenceMarker.length) {
-        openFence = false
-        fenceMarker = ""
+    if (state.lineCount === 0) {
+      // frontmatter只可能从文首开始；首行确定后，后续append不得重新解释历史文本。
+      const marker = /^(---|\+\+\+)\s*$/.exec(line)?.[1]
+      if (marker === "---" || marker === "+++") state.frontmatterMarker = marker
+    } else if (state.frontmatterMarker) {
+      // frontmatter未闭合前不解释fence/reference，避免YAML内容污染Markdown边界状态。
+      if (trimmed === state.frontmatterMarker) {
+        state.frontmatterMarker = undefined
+        state.frontmatterEnd = newline + 1
+        state.lastSafe = state.frontmatterEnd
       }
+      state.lineCount++
+      lineStart = newline + 1
+      state.scanOffset = lineStart
       continue
     }
 
-    if (fenceMatch) {
-      openFence = true
-      fenceMarker = fenceMatch[1]
-      continue
+    if (!state.frontmatterMarker) {
+      const marker = /^(`{3,}|~{3,})/.exec(trimmed)?.[1]
+      if (state.openFenceStart !== undefined) {
+        // closer 的 marker 后只能有空白；```text 在代码块内不能提前关闭 fence。
+        // marker字符和最短长度沿用opener，tilde/backtick不得互相关闭。
+        const closer = /^(`{3,}|~{3,})[ \t]*$/.exec(trimmed)?.[1]
+        if (closer && closer[0] === state.fenceMarker?.[0] && closer.length >= state.fenceMarker.length) {
+          state.openFenceStart = undefined
+          state.fenceMarker = undefined
+          state.fenceRollback = undefined
+        }
+      } else if (marker) {
+        // opener可以携带info string；只有closer才要求marker后纯空白。
+        state.openFenceStart = lineStart
+        state.fenceMarker = marker
+        // fence 内部的空行不能推进 stable prefix，回退点在 opener 到达时就固定。
+        state.fenceRollback = state.lastSafe
+      } else if (hasReferenceUsage(line)) {
+        // 后续 definition仍可能改变 usage 语义，之后的 append 只能扫描状态而不能推进 cut。
+        // 该冻结是保守且单向的，直到rewrite或semantic invalidation重建cache。
+        state.referenceBlocked = true
+      } else if (!state.referenceBlocked && trimmed === "") {
+        // 空行只在fence/reference之外推进stable cut，保证后续block仍有完整上下文。
+        state.lastSafe = newline + 1
+      }
     }
 
-    if (hasReferenceUsage(line)) {
-      // 后续 definition仍可能改变此行语义，usage所在行及之后必须留在完整上下文tail。
-      return lastSafe
-    }
-
-    if (trimmed === "" && index !== lines.length - 1) {
-      lastSafe = Math.min(content.length, lineStart + line.length + 1)
-    }
+    state.lineCount++
+    // 每次循环都推进cursor和lineCount，保证同一suffix不会被下一帧重复消费。
+    lineStart = newline + 1
+    state.scanOffset = lineStart
   }
 
-  if (openFence) {
-    const previousBlank = content.lastIndexOf("\n\n")
-    const fenceStart = findOpenFenceStart(content)
-    let rollback = previousBlank === -1 ? 0 : previousBlank + 2
-    if (rollback > fenceStart) {
-      const earlierBlank = content.lastIndexOf("\n\n", Math.max(0, fenceStart - 1))
-      rollback = earlierBlank === -1 ? 0 : earlierBlank + 2
-    }
-    lastSafe = Math.min(lastSafe, rollback)
-  }
+  state.contentLength = content.length
+  return state
+}
 
-  const frontmatterState = getFrontmatterState(content)
-  if (frontmatterState >= 0) {
-    if (frontmatterState === 0) return 0
-    return Math.max(frontmatterState, lastSafe >= frontmatterState ? lastSafe : frontmatterState)
-  }
-
-  return lastSafe
+function markdownBoundaryCut(state: MarkdownBoundaryState): number {
+  // open frontmatter必须保留全文上下文；closed frontmatter才可成为最早稳定前缀。
+  if (state.frontmatterMarker) return 0
+  // open fence内部即使出现空行，也只能回到opener到达前记录的rollback点。
+  if (state.openFenceStart !== undefined) return Math.min(state.lastSafe, state.fenceRollback ?? state.lastSafe)
+  // frontmatter关闭位置是独立的稳定边界，不能被后续普通Markdown空行覆盖。
+  if (state.frontmatterEnd !== undefined) return Math.max(state.frontmatterEnd, state.lastSafe)
+  // reference冻结或普通文本都从最近确认的完整空行结束，绝不切入partial line。
+  // 这个返回值是stable-prefix cache唯一的边界来源，不能由tail highlights反向推断。
+  return state.lastSafe
 }
 
 function hasReferenceUsage(line: string): boolean {
@@ -805,29 +925,6 @@ function hasReferenceUsage(line: string): boolean {
 
   const next = line[match.index + match[0].length]
   return next !== "(" && next !== ":"
-}
-
-function findOpenFenceStart(content: string): number {
-  const lines = content.split("\n")
-  let offset = 0
-  let openAt = -1
-  let marker = ""
-
-  for (const line of lines) {
-    const start = offset
-    offset += line.length + 1
-    const match = line.trim().match(/^(`{3,}|~{3,})/)
-    if (!match) continue
-    if (openAt === -1) {
-      openAt = start
-      marker = match[1]
-    } else if (match[1][0] === marker[0] && match[1].length >= marker.length) {
-      openAt = -1
-      marker = ""
-    }
-  }
-
-  return openAt === -1 ? content.length : openAt
 }
 
 function getFrontmatterState(content: string): number {

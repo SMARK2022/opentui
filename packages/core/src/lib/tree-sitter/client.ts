@@ -55,6 +55,17 @@ interface PendingRequest {
   reject: (error: Error) => void
 }
 
+type HighlightOnceResult = { highlights?: SimpleHighlight[]; warning?: string; error?: string }
+
+interface OneShotHighlightRequest {
+  messageId: string
+  content: string
+  filetype: string
+  resolve: (response: HighlightOnceResult) => void
+  reject: (error: Error) => void
+  removeAbortListener?: () => void
+}
+
 let DEFAULT_PARSER_OVERRIDES: FiletypeParserOptions[] = []
 
 export function addDefaultParsers(parsers: FiletypeParserOptions[]): void {
@@ -73,6 +84,15 @@ const isUrl = (path: string) => path.startsWith("http://") || path.startsWith("h
 export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
   private initialized = false
   private worker: TreeSitterWorkerHandle | undefined
+  private oneShotWorker: TreeSitterWorkerHandle | undefined
+  private oneShotWorkerInitialized = false
+  private oneShotWorkerInitialization: Promise<void> | undefined
+  private oneShotWorkerTermination: Promise<void> | undefined
+  private oneShotInitializationResolvers:
+    | { worker: TreeSitterWorkerHandle; resolve: () => void; reject: (error: Error) => void; timeoutId: ReturnType<typeof setTimeout> }
+    | undefined
+  private oneShotRequests = new Map<string, OneShotHighlightRequest>()
+  private registeredFiletypeParsers = new Map<string, FiletypeParserOptions>()
   private buffers: Map<number, BufferState> = new Map()
   private initializePromise: Promise<void> | undefined
   private initializeResolvers:
@@ -152,6 +172,249 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
       throw new Error("TreeSitter worker is not available")
     }
     this.worker.postMessage(message)
+  }
+
+  private async ensureOneShotWorker(skipTermination = false): Promise<TreeSitterWorkerHandle> {
+    if (!skipTermination && this.oneShotWorkerTermination) {
+      await this.oneShotWorkerTermination
+    }
+
+    if (this.oneShotWorker && this.oneShotWorkerInitialized) {
+      return this.oneShotWorker
+    }
+
+    if (this.oneShotWorkerInitialization) {
+      await this.oneShotWorkerInitialization
+      if (this.oneShotWorker) return this.oneShotWorker
+      throw new Error("TreeSitter one-shot worker is unavailable")
+    }
+
+    const worker = new PlatformWorker(this.resolveWorkerPath())
+    this.oneShotWorker = worker
+    worker.onmessage = (event) => {
+      if (this.oneShotWorker !== worker) return
+      this.handleOneShotWorkerMessage(event as WorkerMessageEvent<TreeSitterWorkerResponse>)
+    }
+    worker.onerror = (event) => {
+      if (this.oneShotWorker !== worker) return
+      this.handleOneShotWorkerFailure(worker, new Error(`Worker error: ${event.message}`, { cause: event.error }))
+    }
+
+    const initialization = this.initializeOneShotWorker(worker)
+    this.oneShotWorkerInitialization = initialization
+
+    try {
+      await initialization
+      return worker
+    } catch (error) {
+      if (this.oneShotWorker === worker) {
+        this.oneShotWorker = undefined
+        this.oneShotWorkerInitialized = false
+        worker.onmessage = null
+        worker.onerror = null
+        try {
+          const termination = worker.terminate()
+          if (termination && typeof (termination as PromiseLike<number>).then === "function") {
+            await termination
+          }
+        } catch {
+          // Initialization already failed; do not replace it with cleanup noise.
+        }
+      }
+      throw error
+    } finally {
+      if (this.oneShotWorkerInitialization === initialization) {
+        this.oneShotWorkerInitialization = undefined
+      }
+    }
+  }
+
+  private async initializeOneShotWorker(worker: TreeSitterWorkerHandle): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      const timeoutMs = this.options.initTimeout ?? 10000
+      const timeoutId = setTimeout(() => {
+        this.oneShotInitializationResolvers = undefined
+        reject(new Error("TreeSitter one-shot worker initialization timed out"))
+      }, timeoutMs)
+
+      this.oneShotInitializationResolvers = { worker, resolve, reject, timeoutId }
+      try {
+        worker.postMessage({ type: "INIT", dataPath: this.options.dataPath })
+      } catch (error) {
+        clearTimeout(timeoutId)
+        this.oneShotInitializationResolvers = undefined
+        reject(error instanceof Error ? error : new Error(String(error)))
+      }
+    })
+
+    if (this.oneShotWorker !== worker) {
+      throw new Error("TreeSitter one-shot worker initialization was invalidated")
+    }
+
+    await this.registerOneShotParsers(worker)
+    if (this.oneShotWorker !== worker) {
+      throw new Error("TreeSitter one-shot worker initialization was invalidated")
+    }
+    this.oneShotWorkerInitialized = true
+  }
+
+  private async restartOneShotWorker(): Promise<void> {
+    if (this.oneShotWorkerTermination) {
+      await this.oneShotWorkerTermination
+      return
+    }
+
+    const worker = this.oneShotWorker
+    if (!worker) return
+
+    const restart = (async () => {
+      this.oneShotWorker = undefined
+      this.oneShotWorkerInitialized = false
+      worker.onmessage = null
+      worker.onerror = null
+
+      try {
+        const termination = worker.terminate()
+        if (termination && typeof (termination as PromiseLike<number>).then === "function") {
+          await termination
+        }
+      } catch (error) {
+        throw createWorkerTerminationError(error)
+      }
+
+      if (this.oneShotRequests.size === 0) return
+
+      const replacement = await this.ensureOneShotWorker(true)
+      for (const request of this.oneShotRequests.values()) {
+        this.sendOneShotRequest(request, replacement)
+      }
+    })()
+
+    this.oneShotWorkerTermination = restart
+    try {
+      await restart
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error(String(error))
+      this.rejectOneShotRequests(failure)
+      throw failure
+    } finally {
+      if (this.oneShotWorkerTermination === restart) {
+        this.oneShotWorkerTermination = undefined
+      }
+    }
+  }
+
+  private async stopOneShotWorker(): Promise<void> {
+    if (this.oneShotWorkerTermination) {
+      await this.oneShotWorkerTermination
+    }
+
+    const worker = this.oneShotWorker
+    if (!worker) return
+
+    this.oneShotWorker = undefined
+    this.oneShotWorkerInitialized = false
+    worker.onmessage = null
+    worker.onerror = null
+
+    const initialization = this.oneShotInitializationResolvers
+    if (initialization?.worker === worker) {
+      clearTimeout(initialization.timeoutId)
+      this.oneShotInitializationResolvers = undefined
+      initialization.reject(new Error("TreeSitter client destroyed"))
+    }
+
+    const termination = worker.terminate()
+    if (termination && typeof (termination as PromiseLike<number>).then === "function") {
+      await termination
+    }
+  }
+
+  private sendOneShotRequest(request: OneShotHighlightRequest, worker: TreeSitterWorkerHandle): void {
+    try {
+      worker.postMessage({
+        type: "ONESHOT_HIGHLIGHT",
+        content: request.content,
+        filetype: request.filetype,
+        messageId: request.messageId,
+      })
+    } catch (error) {
+      this.oneShotRequests.delete(request.messageId)
+      request.removeAbortListener?.()
+      request.reject(error instanceof Error ? error : new Error(String(error)))
+    }
+  }
+
+  private rejectOneShotRequests(error: Error): void {
+    const requests = Array.from(this.oneShotRequests.values())
+    this.oneShotRequests.clear()
+    for (const request of requests) {
+      request.removeAbortListener?.()
+      request.reject(error)
+    }
+  }
+
+  private handleOneShotWorkerMessage(event: WorkerMessageEvent<TreeSitterWorkerResponse>): void {
+    const message = event.data
+
+    if (message.type === "INIT_RESPONSE") {
+      const initialization = this.oneShotInitializationResolvers
+      if (!initialization || initialization.worker !== this.oneShotWorker) return
+
+      clearTimeout(initialization.timeoutId)
+      this.oneShotInitializationResolvers = undefined
+      if (message.error) {
+        initialization.reject(new Error(message.error))
+      } else {
+        initialization.resolve()
+      }
+      return
+    }
+
+    if (message.type !== "ONESHOT_HIGHLIGHT_RESPONSE") return
+
+    const request = this.oneShotRequests.get(message.messageId)
+    if (!request) return
+
+    this.oneShotRequests.delete(message.messageId)
+    request.removeAbortListener?.()
+    request.resolve({ highlights: message.highlights, warning: message.warning, error: message.error })
+  }
+
+  private handleOneShotWorkerFailure(worker: TreeSitterWorkerHandle, error: Error): void {
+    if (this.oneShotWorker !== worker) return
+
+    const initialization = this.oneShotInitializationResolvers
+    if (initialization?.worker === worker) {
+      clearTimeout(initialization.timeoutId)
+      this.oneShotInitializationResolvers = undefined
+      initialization.reject(error)
+    }
+
+    this.oneShotWorker = undefined
+    this.oneShotWorkerInitialized = false
+    worker.onmessage = null
+    worker.onerror = null
+    this.rejectOneShotRequests(error)
+    try {
+      void Promise.resolve(worker.terminate()).catch(() => {})
+    } catch {
+      // The worker has already failed; cleanup is best effort.
+    }
+  }
+
+  private async abortOneShotRequest(request: OneShotHighlightRequest): Promise<void> {
+    if (this.oneShotRequests.get(request.messageId) !== request) return
+
+    this.oneShotRequests.delete(request.messageId)
+    request.removeAbortListener?.()
+    try {
+      await this.restartOneShotWorker()
+    } catch (error) {
+      request.reject(error instanceof Error ? error : new Error(String(error)))
+      throw error
+    }
+    request.reject(createAbortError())
   }
 
   private rejectPendingRequests(error: Error): void {
@@ -332,16 +595,29 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
     generation: number = this.lifecycleGeneration,
     worker: TreeSitterWorkerHandle = this.worker!,
   ): Promise<void> {
-    const defaultParsers = await getParsers()
+    const parsers = await this.getDefaultParserDefinitions()
     this.assertCurrentInitialization(generation, worker)
-    const overriddenFiletypes = new Set(DEFAULT_PARSER_OVERRIDES.map((parser) => parser.filetype))
-
-    for (const parser of [
-      ...defaultParsers.filter((parser) => !overriddenFiletypes.has(parser.filetype)),
-      ...DEFAULT_PARSER_OVERRIDES,
-    ]) {
-      worker.postMessage({ type: "ADD_FILETYPE_PARSER", filetypeParser: this.resolveFiletypeParser(parser) })
+    for (const parser of parsers) {
+      worker.postMessage({ type: "ADD_FILETYPE_PARSER", filetypeParser: parser })
     }
+  }
+
+  private async registerOneShotParsers(worker: TreeSitterWorkerHandle): Promise<void> {
+    for (const parser of await this.getDefaultParserDefinitions()) {
+      worker.postMessage({ type: "ADD_FILETYPE_PARSER", filetypeParser: parser })
+    }
+
+    for (const parser of this.registeredFiletypeParsers.values()) {
+      worker.postMessage({ type: "ADD_FILETYPE_PARSER", filetypeParser: parser })
+    }
+  }
+
+  private async getDefaultParserDefinitions(): Promise<FiletypeParserOptions[]> {
+    const defaultParsers = await getParsers()
+    const overriddenFiletypes = new Set(DEFAULT_PARSER_OVERRIDES.map((parser) => parser.filetype))
+    return [...defaultParsers.filter((parser) => !overriddenFiletypes.has(parser.filetype)), ...DEFAULT_PARSER_OVERRIDES].map(
+      (parser) => this.resolveFiletypeParser(parser),
+    )
   }
 
   private resolvePath(path: string): string {
@@ -358,7 +634,10 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
   }
 
   public addFiletypeParser(filetypeParser: FiletypeParserOptions): void {
-    this.sendWorkerMessage({ type: "ADD_FILETYPE_PARSER", filetypeParser: this.resolveFiletypeParser(filetypeParser) })
+    const parser = this.resolveFiletypeParser(filetypeParser)
+    this.registeredFiletypeParsers.set(parser.filetype, parser)
+    this.sendWorkerMessage({ type: "ADD_FILETYPE_PARSER", filetypeParser: parser })
+    this.oneShotWorker?.postMessage({ type: "ADD_FILETYPE_PARSER", filetypeParser: parser })
   }
 
   private resolveFiletypeParser(filetypeParser: FiletypeParserOptions): FiletypeParserOptions {
@@ -391,29 +670,46 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
   public async highlightOnce(
     content: string,
     filetype: string,
-  ): Promise<{ highlights?: SimpleHighlight[]; warning?: string; error?: string }> {
-    if (!this.initialized) {
-      try {
-        await this.initialize()
-      } catch (error) {
-        return { error: "Could not highlight because of initialization error" }
-      }
+    signal?: AbortSignal,
+  ): Promise<HighlightOnceResult> {
+    if (signal?.aborted) {
+      throw createAbortError()
+    }
+
+    let worker: TreeSitterWorkerHandle
+    try {
+      worker = await this.ensureOneShotWorker()
+    } catch {
+      if (signal?.aborted) throw createAbortError()
+      return { error: "Could not highlight because of initialization error" }
+    }
+
+    if (signal?.aborted) {
+      await this.restartOneShotWorker()
+      throw createAbortError()
     }
 
     const messageId = `oneshot_${this.messageIdCounter++}`
     return new Promise((resolve, reject) => {
-      this.messageCallbacks.set(messageId, { resolve, reject })
-      try {
-        this.sendWorkerMessage({
-          type: "ONESHOT_HIGHLIGHT",
-          content,
-          filetype,
-          messageId,
-        })
-      } catch (error) {
-        this.messageCallbacks.delete(messageId)
-        reject(error instanceof Error ? error : new Error(String(error)))
+      const request: OneShotHighlightRequest = { messageId, content, filetype, resolve, reject }
+      this.oneShotRequests.set(messageId, request)
+
+      if (signal) {
+        const abort = () => {
+          void this.abortOneShotRequest(request).catch((error: unknown) => {
+            this.emitError(error instanceof Error ? error.message : String(error))
+          })
+        }
+        signal.addEventListener("abort", abort, { once: true })
+        request.removeAbortListener = () => signal.removeEventListener("abort", abort)
       }
+
+      if (signal?.aborted) {
+        void this.abortOneShotRequest(request)
+        return
+      }
+
+      this.sendOneShotRequest(request, worker)
     })
   }
 
@@ -717,6 +1013,7 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
     this.initializePromise = undefined
     this.rejectActiveInitialization(destroyError)
     this.rejectPendingRequests(new Error("TreeSitter client destroyed"))
+    this.rejectOneShotRequests(new Error("TreeSitter client destroyed"))
 
     for (const callback of this.destroyCallbacks) {
       try {
@@ -733,7 +1030,7 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
     this.editQueues.clear()
     this.buffers.clear()
 
-    void this.stopWorker().then(
+    void Promise.all([this.stopWorker(), this.stopOneShotWorker()]).then(
       () => {
         this.workerTerminationFailed = false
         if (this.destroyPromise === destroyPromise) {
@@ -791,7 +1088,7 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
 
     if (this.initialized && this.worker) {
       const messageId = `update_datapath_${this.messageIdCounter++}`
-      return new Promise<void>((resolve, reject) => {
+      await new Promise<void>((resolve, reject) => {
         this.messageCallbacks.set(messageId, {
           resolve: (response: any) => {
             if (response.error) {
@@ -814,6 +1111,10 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
         }
       })
     }
+
+    if (this.oneShotWorker) {
+      await this.restartOneShotWorker()
+    }
   }
 
   public async clearCache(): Promise<void> {
@@ -822,7 +1123,7 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
     }
 
     const messageId = `clear_cache_${this.messageIdCounter++}`
-    return new Promise<void>((resolve, reject) => {
+    await new Promise<void>((resolve, reject) => {
       this.messageCallbacks.set(messageId, {
         resolve: (response: any) => {
           if (response.error) {
@@ -843,5 +1144,23 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
         reject(error instanceof Error ? error : new Error(String(error)))
       }
     })
+
+    if (this.oneShotWorker) {
+      await this.restartOneShotWorker()
+    }
   }
+}
+
+function createAbortError(): Error {
+  const error = new Error("TreeSitter highlight aborted")
+  error.name = "AbortError"
+  return error
+}
+
+function createWorkerTerminationError(error: unknown): Error {
+  if (error instanceof Error && error.name === "TreeSitterWorkerTerminationError") return error
+
+  const failure = new Error("TreeSitter one-shot worker termination failed", { cause: error })
+  failure.name = "TreeSitterWorkerTerminationError"
+  return failure
 }

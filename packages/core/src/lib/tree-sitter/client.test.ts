@@ -1301,7 +1301,7 @@ describe("TreeSitterClient Edge Cases", () => {
     expect(internals.worker).toBeUndefined()
   })
 
-  test("should reject pending requests when an initialized worker errors", async () => {
+  test("should reject pending shared-worker requests when an initialized worker errors", async () => {
     const client = new TreeSitterClient({ dataPath })
     await client.initialize()
 
@@ -1319,7 +1319,7 @@ describe("TreeSitterClient Edge Cases", () => {
     }
 
     const originalPostMessage = worker.postMessage.bind(worker)
-    const blockedTypes = new Set(["GET_PERFORMANCE", "PRELOAD_PARSER", "ONESHOT_HIGHLIGHT"])
+    const blockedTypes = new Set(["GET_PERFORMANCE", "PRELOAD_PARSER"])
     worker.postMessage = (message) => {
       if (!blockedTypes.has(message.type ?? "")) {
         originalPostMessage(message)
@@ -1333,11 +1333,10 @@ describe("TreeSitterClient Edge Cases", () => {
     const outcomes = [
       observe(client.getPerformance()),
       observe(client.preloadParser("javascript")),
-      observe(client.highlightOnce("const value = 1", "javascript")),
     ]
 
     try {
-      expect(internals.messageCallbacks.size).toBe(3)
+      expect(internals.messageCallbacks.size).toBe(2)
       expect(worker.onerror).not.toBeNull()
       worker.onerror?.({ message: "synthetic post-init failure" })
 
@@ -1431,4 +1430,39 @@ describe("TreeSitterClient Edge Cases", () => {
 
     destroySingleton("data-paths-opentui")
   })
+
+  test("terminates a hung one-shot worker before the next request", async () => {
+    const client = new TreeSitterClient({
+      dataPath,
+      workerPath: new URL("./client-worker.fixture.ts", import.meta.url),
+    })
+
+    try {
+      const first = await client.highlightOnce("ready", "javascript")
+      const controller = new AbortController()
+      const hanging = client.highlightOnce("hang", "javascript", controller.signal)
+
+      await new Promise((resolve) => setTimeout(resolve, 25))
+      controller.abort()
+
+      const aborted = await Promise.race([
+        hanging.then(
+          () => ({ status: "fulfilled" as const }),
+          (error: unknown) => ({ status: "rejected" as const, error }),
+        ),
+        new Promise<{ status: "timed-out" }>((resolve) => setTimeout(() => resolve({ status: "timed-out" }), 500)),
+      ])
+
+      expect(aborted.status).toBe("rejected")
+      if (aborted.status === "rejected") {
+        expect((aborted.error as Error).name).toBe("AbortError")
+      }
+
+      const replacement = await client.highlightOnce("ready", "javascript")
+      expect(replacement.warning).toBeDefined()
+      expect(replacement.warning).not.toBe(first.warning)
+    } finally {
+      await client.destroy()
+    }
+  }, 5000)
 })

@@ -61,6 +61,61 @@ pub fn walkLines(
     }
 }
 
+/// Iterate only lines whose display range overlaps [char_start, char_end).
+/// 先用linestart marker二分定位，再按原walkLines的LineInfo语义顺序输出。
+pub fn walkLinesInCharRange(
+    rope: *UnifiedRope,
+    char_start: u32,
+    char_end: u32,
+    ctx: *anyopaque,
+    callback: *const fn (ctx: *anyopaque, line_info: LineInfo) void,
+    include_newlines_in_offset: bool,
+) void {
+    if (char_start >= char_end) return;
+
+    const linestart_count = rope.markerCount(.linestart);
+    if (linestart_count == 0) return;
+
+    var left: u32 = 0;
+    var right: u32 = linestart_count;
+    while (left < right) {
+        const middle = left + (right - left) / 2;
+        const marker = rope.getMarker(.linestart, middle) orelse return;
+        const line_start_weight = marker.global_weight;
+        const col_offset = if (include_newlines_in_offset) line_start_weight else line_start_weight - middle;
+        const width_cols = lineWidthAt(rope, middle);
+        if (col_offset + width_cols <= char_start) {
+            left = middle + 1;
+        } else {
+            right = middle;
+        }
+    }
+
+    var index = left;
+    while (index < linestart_count) : (index += 1) {
+        const marker = rope.getMarker(.linestart, index) orelse break;
+        const line_start_weight = marker.global_weight;
+        const col_offset = if (include_newlines_in_offset) line_start_weight else line_start_weight - index;
+        if (col_offset >= char_end) break;
+
+        const width_cols = lineWidthAt(rope, index);
+        if (col_offset + width_cols <= char_start) continue;
+
+        const seg_end = if (index + 1 < linestart_count) blk: {
+            const next_marker = rope.getMarker(.linestart, index + 1) orelse break :blk marker.leaf_index + 1;
+            break :blk next_marker.leaf_index;
+        } else rope.count();
+
+        callback(ctx, .{
+            .line_idx = index,
+            .col_offset = col_offset,
+            .width_cols = width_cols,
+            .seg_start = marker.leaf_index,
+            .seg_end = seg_end,
+        });
+    }
+}
+
 /// This is the most efficient way to iterate lines and their content
 pub fn walkLinesAndSegments(
     rope: *const UnifiedRope,

@@ -131,7 +131,7 @@ jobs:
             --verify-tag \
             --prerelease \
             --title "OpenTUI ${{ needs.prepare.outputs.release-tag }} (SMARK)" \
-            --notes "OpenTUI ${{ needs.prepare.outputs.release-tag }} with the SMARK CJK and wide-grapheme overlay fixes, built from SMARK2022/opentui:smark/main. Windows DLL assets are unsigned."
+            --notes "OpenTUI ${{ needs.prepare.outputs.release-tag }} with the streaming Markdown persistent-tree and stable-prefix caching fixes, built from SMARK2022/opentui:smark/main. Windows DLL assets are unsigned."
 
       - name: Publish immutable release
         run: gh release edit "${{ needs.prepare.outputs.release-tag }}" --draft=false --prerelease

@@ -1301,7 +1301,7 @@ describe("TreeSitterClient Edge Cases", () => {
     expect(internals.worker).toBeUndefined()
   })
 
-  test("should reject pending shared-worker requests when an initialized worker errors", async () => {
+  test("should reject pending requests when an initialized worker errors", async () => {
     const client = new TreeSitterClient({ dataPath })
     await client.initialize()
 
@@ -1319,7 +1319,7 @@ describe("TreeSitterClient Edge Cases", () => {
     }
 
     const originalPostMessage = worker.postMessage.bind(worker)
-    const blockedTypes = new Set(["GET_PERFORMANCE", "PRELOAD_PARSER"])
+    const blockedTypes = new Set(["GET_PERFORMANCE", "PRELOAD_PARSER", "ONESHOT_HIGHLIGHT"])
     worker.postMessage = (message) => {
       if (!blockedTypes.has(message.type ?? "")) {
         originalPostMessage(message)
@@ -1333,10 +1333,11 @@ describe("TreeSitterClient Edge Cases", () => {
     const outcomes = [
       observe(client.getPerformance()),
       observe(client.preloadParser("javascript")),
+      observe(client.highlightOnce("const value = 1", "javascript")),
     ]
 
     try {
-      expect(internals.messageCallbacks.size).toBe(2)
+      expect(internals.messageCallbacks.size).toBe(3)
       expect(worker.onerror).not.toBeNull()
       worker.onerror?.({ message: "synthetic post-init failure" })
 
@@ -1431,38 +1432,56 @@ describe("TreeSitterClient Edge Cases", () => {
     destroySingleton("data-paths-opentui")
   })
 
-  test("terminates a hung one-shot worker before the next request", async () => {
-    const client = new TreeSitterClient({
-      dataPath,
-      workerPath: new URL("./client-worker.fixture.ts", import.meta.url),
+  describe("streaming buffer updates", () => {
+    let streamingClient: TreeSitterClient
+    const streamingDataPath = join(tmpdir(), "tree-sitter-shared-test-data")
+
+    beforeEach(() => {
+      streamingClient = new TreeSitterClient({ dataPath: streamingDataPath })
     })
 
-    try {
-      const first = await client.highlightOnce("ready", "javascript")
-      const controller = new AbortController()
-      const hanging = client.highlightOnce("hang", "javascript", controller.signal)
+    afterEach(async () => {
+      // 每个用例独立 client 并显式销毁：worker 是真实线程，串用例共享会掩盖 owner 语义。
+      await streamingClient.destroy()
+    })
 
-      await new Promise((resolve) => setTimeout(resolve, 25))
-      controller.abort()
+    test("returns an awaitable versioned result with a parser-owned tail boundary", async () => {
+      // 该协议是 persistent path 的地基：版本化结果 + parser 给出的 tail 边界，缺一不可。
+      await streamingClient.initialize()
 
-      const aborted = await Promise.race([
-        hanging.then(
-          () => ({ status: "fulfilled" as const }),
-          (error: unknown) => ({ status: "rejected" as const, error }),
-        ),
-        new Promise<{ status: "timed-out" }>((resolve) => setTimeout(() => resolve({ status: "timed-out" }), 500)),
-      ])
+      const initial = "# Title\n\nFirst paragraph.\n\n"
+      const id = await streamingClient.createStreamingBuffer(initial, "markdown")
+      expect(id).not.toBeNull()
 
-      expect(aborted.status).toBe("rejected")
-      if (aborted.status === "rejected") {
-        expect((aborted.error as Error).name).toBe("AbortError")
-      }
+      // 流式场景不再需要监听事件：调用方直接等待当前版本的解析结果。
+      const appended = initial + "| a | b |\n| - | - |\n| 1 | 2 |\n"
+      const result = await streamingClient.updateStreamingBuffer(id!, appended, 0)
 
-      const replacement = await client.highlightOnce("ready", "javascript")
-      expect(replacement.warning).toBeDefined()
-      expect(replacement.warning).not.toBe(first.warning)
-    } finally {
-      await client.destroy()
-    }
-  }, 5000)
+      // createBuffer 的初始 version 是 1，第一次 update 必须递增为 2；版本错位会破坏 stale 判定。
+      expect(result.version).toBe(2)
+      // 表格是最后一个未闭合 render block，tailStart 必须指向它的起点而不是 section 起点。
+      expect(result.tailStart).toBe(initial.length)
+      expect(result.highlights.length).toBeGreaterThan(0)
+
+      await streamingClient.removeStreamingBuffer(id!)
+      // 释放后 buffer 状态必须同步消失，否则后续 update 会写入一个已失效的 parser tree。
+      expect(streamingClient.getBuffer(id!)).toBeUndefined()
+      // 生命周期闭合是 INV-06 的协议侧证据：创建-更新-释放全链路无残留。
+    })
+
+    test("applies closing-fence normalization so streamed highlights equal one-shot highlights", async () => {
+      await streamingClient.initialize()
+
+      // markdown parser 只有在闭合 ``` 后存在换行时才生成闭合节点，这是既有 one-shot 兼容合同。
+      const content = "```ts\nconst a = 1\n```"
+      const id = await streamingClient.createStreamingBuffer(content, "markdown")
+      const streamed = await streamingClient.updateStreamingBuffer(id!, content, 0)
+      // one-shot 是既有发布行为的 oracle：persistent path 的 highlights 必须逐位一致。
+      const oneShot = await streamingClient.highlightOnce(content, "markdown")
+
+      expect(streamed.highlights).toEqual(oneShot.highlights ?? [])
+
+      await streamingClient.removeStreamingBuffer(id!)
+    })
+  })
 })

@@ -1448,6 +1448,8 @@ test("streaming structured lists reuse existing renderables while appending", as
 
 test("streaming structured list updates keep previous item text visible while highlighting", async () => {
   const mockTreeSitterClient = new MockTreeSitterClient()
+  // 段落块走 persistent streaming seam；挂起更新才能复现“高亮未完成”的反闪烁窗口。
+  mockTreeSitterClient.streamingAutoResolve = false
   const md = createMarkdownRenderable({
     id: "markdown-streaming-structured-list-no-flicker",
     content: "- alp\n- bet\n- gam",
@@ -1459,10 +1461,10 @@ test("streaming structured list updates keep previous item text visible while hi
 
   renderer.root.add(md)
   await renderOnce()
-  expect(mockTreeSitterClient.isHighlighting()).toBe(true)
+  expect(mockTreeSitterClient.pendingStreamingUpdates()).toBeGreaterThan(0)
   const initialHighlights = getPendingMarkdownParagraphHighlights(md)
   expect(initialHighlights.length).toBeGreaterThan(0)
-  mockTreeSitterClient.resolveAllHighlightOnce()
+  mockTreeSitterClient.resolveAllStreamingUpdates()
   await Promise.all(initialHighlights.map((codeBlock) => waitForHighlight(codeBlock)))
   await renderOnce()
 
@@ -1490,8 +1492,8 @@ test("streaming structured list updates keep previous item text visible while hi
     expect(frame).toContain("- gam")
   }
 
-  expect(mockTreeSitterClient.isHighlighting()).toBe(true)
-  mockTreeSitterClient.resolveAllHighlightOnce()
+  expect(mockTreeSitterClient.pendingStreamingUpdates()).toBeGreaterThan(0)
+  mockTreeSitterClient.resolveAllStreamingUpdates()
   await Promise.all(updatedHighlights.map((codeBlock) => waitForHighlight(codeBlock)))
   await renderOnce()
   recorder.stop()
@@ -1504,6 +1506,8 @@ test("streaming structured list updates keep previous item text visible while hi
 
 test("streaming nested structured list updates keep previous nested text visible while highlighting", async () => {
   const mockTreeSitterClient = new MockTreeSitterClient()
+  // 与结构化列表用例相同：persistent seam 下挂起更新才能制造高亮未完成窗口。
+  mockTreeSitterClient.streamingAutoResolve = false
   const initialContent = `1. First ordered item with \`inline code\`.
 2. Second ordered item before a nested list:
    - Nested bullet with a long phrase.
@@ -1530,10 +1534,10 @@ test("streaming nested structured list updates keep previous nested text visible
 
   renderer.root.add(md)
   await renderOnce()
-  expect(mockTreeSitterClient.isHighlighting()).toBe(true)
+  expect(mockTreeSitterClient.pendingStreamingUpdates()).toBeGreaterThan(0)
   const initialHighlights = getPendingMarkdownParagraphHighlights(md)
   expect(initialHighlights.length).toBeGreaterThan(0)
-  mockTreeSitterClient.resolveAllHighlightOnce()
+  mockTreeSitterClient.resolveAllStreamingUpdates()
   await Promise.all(initialHighlights.map((codeBlock) => waitForHighlight(codeBlock)))
   await renderOnce()
 
@@ -1561,7 +1565,9 @@ test("streaming nested structured list updates keep previous nested text visible
     expect(frame).toContain("- Nested bullet before fenced co")
   }
 
-  expect(mockTreeSitterClient.isHighlighting()).toBe(true)
+  expect(mockTreeSitterClient.pendingStreamingUpdates()).toBeGreaterThan(0)
+  // markdown 段落块走 streaming seam，fence 等非 markdown 块仍走 one-shot seam，两者都要放行。
+  mockTreeSitterClient.resolveAllStreamingUpdates()
   mockTreeSitterClient.resolveAllHighlightOnce()
   await Promise.all(updatedHighlights.map((codeBlock) => waitForHighlight(codeBlock)))
   await renderOnce()
@@ -3088,9 +3094,14 @@ test("streaming mode keeps trailing tokens unstable", async () => {
 
 test("streaming code blocks with concealCode=true do not flash unconcealed markdown", async () => {
   const mockTreeSitterClient = createMockTreeSitterClient()
-  mockTreeSitterClient.setMockResult({
+  // conceal 高亮走 persistent streaming 结果通道；挂起更新才能观察“未高亮帧不得闪现原文”的窗口。
+  mockTreeSitterClient.streamingAutoResolve = false
+  mockTreeSitterClient.setStreamingResultHandler(() => ({
+    version: 1,
+    changedStart: 0,
+    tailStart: 0,
     highlights: [[0, 1, "conceal", { conceal: "" }]],
-  })
+  }))
 
   const recorder = new TestRecorder(renderer)
   recorder.rec()
@@ -3108,10 +3119,10 @@ test("streaming code blocks with concealCode=true do not flash unconcealed markd
   renderer.root.add(md)
   await renderer.idle()
 
-  expect(mockTreeSitterClient.isHighlighting()).toBe(true)
+  expect(mockTreeSitterClient.pendingStreamingUpdates()).toBeGreaterThan(0)
 
   const codeBlock = md._blockStates[1]?.renderable as CodeRenderable
-  mockTreeSitterClient.resolveAllHighlightOnce()
+  mockTreeSitterClient.resolveAllStreamingUpdates()
   await waitForHighlight(codeBlock)
   await renderer.idle()
 

@@ -27,6 +27,7 @@
     "publish": "bun scripts/publish.ts",
     "test:dist": "bun scripts/dist-test.ts",
     "test:js": "bun test",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
     "test:js:node": "bun scripts/test-node.ts",
     "test": "bun run test:native && bun run test:js"
   },

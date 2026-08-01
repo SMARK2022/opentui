@@ -250,7 +250,8 @@ test("updating markdown fg/bg rerenders markdown fallback renderables", async ()
   const nextFg = RGBA.fromValues(0.75, 0.75, 0.75, 1)
   const nextBg = RGBA.fromValues(0.18, 0.18, 0.18, 1)
   const mockTreeSitterClient = createMockTreeSitterClient()
-  mockTreeSitterClient.highlightOnce = async () => {
+  // 段落块由 persistent streaming 协议处理；错误合同相同的注入点从 highlightOnce 变为 updateStreamingBuffer。
+  mockTreeSitterClient.updateStreamingBuffer = async () => {
     throw new Error("Highlighting failed")
   }
 

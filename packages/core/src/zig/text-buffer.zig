@@ -973,7 +973,7 @@ pub const UnifiedTextBuffer = struct {
             .hl_ref = hl_ref,
             .internal = internal,
         };
-        iter_mod.walkLinesInCharRange(&self._rope, char_start, char_end, &ctx, Context.callback, false);
+        iter_mod.walkLines(&self._rope, &ctx, Context.callback, false);
     }
 
     fn clearInternalHighlights(self: *Self) void {

@@ -4,7 +4,7 @@ import { SyntaxStyle } from "../syntax-style.js"
 import { getTreeSitterClient, TreeSitterClient } from "../lib/tree-sitter/index.js"
 import { TextBufferRenderable, type TextBufferOptions } from "./TextBufferRenderable.js"
 import type { OptimizedBuffer } from "../buffer.js"
-import type { SimpleHighlight } from "../lib/tree-sitter/types.js"
+import type { SimpleHighlight, StreamingUpdateResult } from "../lib/tree-sitter/types.js"
 import type { TextChunk } from "../text-buffer.js"
 import { treeSitterToTextChunks } from "../lib/tree-sitter-styled-text.js"
 
@@ -28,60 +28,6 @@ export type OnChunksCallback = (
   context: ChunkRenderContext,
 ) => TextChunk[] | undefined | Promise<TextChunk[] | undefined>
 
-export interface HighlightErrorEvent {
-  error: Error
-  content: string
-  filetype: string
-}
-
-type HighlightSnapshot = {
-  id: number
-  content: string
-  filetype: string
-  syntaxStyle: SyntaxStyle
-  treeSitterClient: TreeSitterClient
-  conceal: boolean
-  drawUnstyledText: boolean
-  streaming: boolean
-  initialStyledText?: StyledText
-  baseHighlight?: string
-  onHighlight?: OnHighlightCallback
-  onChunks?: OnChunksCallback
-}
-
-type MarkdownHighlightCache = {
-  // `content` 是最近真正解析的快照；boundary 可以领先到尚未解析的最新 append。
-  // 两者分离后，deferred 状态不会把旧 highlights 冒充成新结果。
-  content: string
-  cut: number
-  frontmatterState: number
-  highlights: SimpleHighlight[]
-  boundary: MarkdownBoundaryState
-  parsedLength: number
-  parsedLines: number
-  parsedFenceStart?: number
-}
-
-type MarkdownBoundaryState = {
-  // scanOffset 指向最后一个未闭合行的起点，下一次 append 只重扫该行和新增后缀。
-  // lineCount 只统计完整行，partial closer 不得提前解除 deferred 状态。
-  contentLength: number
-  scanOffset: number
-  lineCount: number
-  lastSafe: number
-  referenceBlocked: boolean
-  frontmatterMarker?: "---" | "+++"
-  frontmatterEnd?: number
-  openFenceStart?: number
-  fenceMarker?: string
-  fenceRollback?: number
-}
-
-type MarkdownHighlightResult = {
-  highlights: SimpleHighlight[]
-  cache: MarkdownHighlightCache
-}
-
 export interface CodeOptions extends TextBufferOptions {
   content?: string
   filetype?: string
@@ -98,20 +44,12 @@ export interface CodeOptions extends TextBufferOptions {
 
 type ConcealLineRange = [start: number, end: number]
 
-const OPEN_FENCE_BATCH_LINES = 32
-const OPEN_FENCE_BATCH_CHARS = 4096
-// 两个门槛取先到者：短行代码受字符上限保护，普通代码则每32行校正一次完整语义。
-// 不使用定时器，避免空闲帧反复唤醒；fence closure和语义变更仍会立即绕过批量门槛。
-
 export class CodeRenderable extends TextBufferRenderable {
   private _content: string
   private _filetype?: string
   private _syntaxStyle: SyntaxStyle
   private _isHighlighting: boolean = false
-  private _highlightAbortController?: AbortController
-  private _markdownHighlightCache?: MarkdownHighlightCache
   private _treeSitterClient: TreeSitterClient
-  private _highlightUnavailable: boolean = false
   private _highlightsDirty: boolean = false
   private _highlightSnapshotId: number = 0
   private _conceal: boolean
@@ -120,10 +58,23 @@ export class CodeRenderable extends TextBufferRenderable {
   private _streaming: boolean
   private _initialStyledText?: StyledText
   private _hadInitialContent: boolean = false
+  private _lastHighlights: SimpleHighlight[] = []
   private _baseHighlight?: string
   private _onHighlight?: OnHighlightCallback
   private _onChunks?: OnChunksCallback
   private _highlightingPromise: Promise<void> = Promise.resolve()
+  // streaming Markdown persistent buffer：一个 buffer、一个 active 更新、一个最新 pending 内容。
+  private _streamingBufferId?: number
+  private _streamingActive: boolean = false
+  private _streamingPending?: string
+  private _streamingIdle: Promise<void> = Promise.resolve()
+  private _streamingIdleResolve?: () => void
+  // 前缀缓存只保存 onChunks 之前的 chunk；end 是 parser 给出的 tailStart（code-unit 块边界）。
+  private _prefixCache?: { end: number; chunks: TextChunk[] }
+  // 缓存失效代数：在途响应的裁剪基准（请求时的 cacheEnd）一旦失效就必须被识别并丢弃。
+  private _cacheGeneration: number = 0
+  // worker 只返回变化区间的 highlights，全量数组在这里增量合并，供 onHighlight 与 conceal 映射使用。
+  private _cachedHighlights: SimpleHighlight[] = []
   // Temporary rendered-line -> source-line map for concealment; native extmarks should replace this.
   private _renderedLineSources?: number[]
   private _mappedLineInfo?: LineInfo
@@ -169,17 +120,12 @@ export class CodeRenderable extends TextBufferRenderable {
 
   set content(value: string) {
     if (this._content !== value) {
-      const appendOnly = value.startsWith(this._content)
-      const coalesceAppend = appendOnly && this._streaming && this._filetype === "markdown"
       this._content = value
-      if (coalesceAppend && this._markdownHighlightCache) {
-        // 边界游标只消费新增后缀，避免长 fence 每个 delta 都同步扫描全部历史。
-        // rewrite 不会进入这里，因此复用的 cursor 必然仍对应同一份 Markdown 前缀。
-        this._markdownHighlightCache.boundary = advanceMarkdownBoundary(value, this._markdownHighlightCache.boundary)
-      }
-      this.invalidateHighlight(appendOnly, !coalesceAppend)
+      this._highlightsDirty = true
+      this._highlightSnapshotId++
 
       if (this._streaming && this._filetype && !this._drawUnstyledText) {
+        this.requestRender()
         return
       }
 
@@ -235,8 +181,10 @@ export class CodeRenderable extends TextBufferRenderable {
 
   set filetype(value: string | undefined) {
     if (this._filetype !== value) {
+      // grammar owner 变化不是 generic reset：必须先释放旧 buffer，再由当前 filetype 懒重建。
+      this.releaseStreamingBuffer()
       this._filetype = value
-      this.invalidateHighlight()
+      this._highlightsDirty = true
     }
   }
 
@@ -247,7 +195,10 @@ export class CodeRenderable extends TextBufferRenderable {
   set syntaxStyle(value: SyntaxStyle) {
     if (this._syntaxStyle !== value) {
       this._syntaxStyle = value
-      this.invalidateHighlight()
+      // chunk 由 style 派生，缓存 chunk 失效；parser tree 与 highlights 缓存仍然有效。
+      this._prefixCache = undefined
+      this._cacheGeneration++
+      this._highlightsDirty = true
     }
   }
 
@@ -258,7 +209,10 @@ export class CodeRenderable extends TextBufferRenderable {
   set conceal(value: boolean) {
     if (this._conceal !== value) {
       this._conceal = value
-      this.invalidateHighlight()
+      // conceal 改变 chunk 文本本身（移除/替换标记符），缓存 chunk 必须重建。
+      this._prefixCache = undefined
+      this._cacheGeneration++
+      this._highlightsDirty = true
     }
   }
 
@@ -269,7 +223,7 @@ export class CodeRenderable extends TextBufferRenderable {
   set drawUnstyledText(value: boolean) {
     if (this._drawUnstyledText !== value) {
       this._drawUnstyledText = value
-      this.invalidateHighlight()
+      this._highlightsDirty = true
     }
   }
 
@@ -280,15 +234,17 @@ export class CodeRenderable extends TextBufferRenderable {
   set initialStyledText(value: StyledText | undefined) {
     if (this._initialStyledText !== value) {
       this._initialStyledText = value
-      this.invalidateHighlight()
+      this._highlightsDirty = true
     }
   }
 
   set streaming(value: boolean) {
     if (this._streaming !== value) {
+      this.releaseStreamingBuffer()
       this._streaming = value
       this._hadInitialContent = false
-      this.invalidateHighlight()
+      this._lastHighlights = []
+      this._highlightsDirty = true
     }
   }
 
@@ -298,8 +254,10 @@ export class CodeRenderable extends TextBufferRenderable {
 
   set treeSitterClient(value: TreeSitterClient) {
     if (this._treeSitterClient !== value) {
+      // buffer 属于旧 client 的 worker 协议，必须通过旧 client 释放，不能带到新 owner。
+      this.releaseStreamingBuffer()
       this._treeSitterClient = value
-      this.invalidateHighlight()
+      this._highlightsDirty = true
     }
   }
 
@@ -314,14 +272,19 @@ export class CodeRenderable extends TextBufferRenderable {
   set baseHighlight(value: string | undefined) {
     if (this._baseHighlight !== value) {
       this._baseHighlight = value
-      this.invalidateHighlight()
+      this._prefixCache = undefined
+      this._cacheGeneration++
+      this._highlightsDirty = true
     }
   }
 
   set onHighlight(value: OnHighlightCallback | undefined) {
     if (this._onHighlight !== value) {
       this._onHighlight = value
-      this.invalidateHighlight()
+      // 任意 onHighlight range 可能跨越缓存切点，存在期间禁用前缀 chunk 缓存。
+      this._prefixCache = undefined
+      this._cacheGeneration++
+      this._highlightsDirty = true
     }
   }
 
@@ -332,7 +295,7 @@ export class CodeRenderable extends TextBufferRenderable {
   set onChunks(value: OnChunksCallback | undefined) {
     if (this._onChunks !== value) {
       this._onChunks = value
-      this.invalidateHighlight()
+      this._highlightsDirty = true
     }
   }
 
@@ -340,57 +303,14 @@ export class CodeRenderable extends TextBufferRenderable {
     return this._isHighlighting
   }
 
-  get highlightUnavailable(): boolean {
-    return this._highlightUnavailable
-  }
-
   get highlightingDone(): Promise<void> {
     return this._highlightingPromise
   }
 
-  private invalidateHighlight(preserveMarkdownCache = false, abortActive = true): void {
-    this._highlightUnavailable = false
-    this._highlightsDirty = true
-    this._highlightSnapshotId++
-    // snapshot id始终递增，保证deferred期间到达的setter仍会让旧callback失效。
-    // 只有可证明的Markdown prefix append才允许跳过abort；其余变更必须立即释放旧worker。
-    if (!preserveMarkdownCache) {
-      // semantic rewrite清除boundary cursor，防止旧文档的line offset被新文档误用。
-      this._markdownHighlightCache = undefined
-    }
-    if (abortActive) this._highlightAbortController?.abort()
-    this.requestRender()
-  }
+  protected async transformChunks(chunks: TextChunk[], context: ChunkRenderContext): Promise<TextChunk[]> {
+    if (!this._onChunks) return chunks
 
-  private captureHighlightSnapshot(): HighlightSnapshot {
-    return {
-      id: this._highlightSnapshotId,
-      content: this._content,
-      filetype: this._filetype ?? "",
-      syntaxStyle: this._syntaxStyle,
-      treeSitterClient: this._treeSitterClient,
-      conceal: this._conceal,
-      drawUnstyledText: this._drawUnstyledText,
-      streaming: this._streaming,
-      initialStyledText: this._initialStyledText,
-      baseHighlight: this._baseHighlight,
-      onHighlight: this._onHighlight,
-      onChunks: this._onChunks,
-    }
-  }
-
-  private isCurrentSnapshot(snapshot: HighlightSnapshot): boolean {
-    return !this.isDestroyed && snapshot.id === this._highlightSnapshotId
-  }
-
-  protected async transformChunks(
-    chunks: TextChunk[],
-    context: ChunkRenderContext,
-    onChunks?: OnChunksCallback,
-  ): Promise<TextChunk[]> {
-    if (!onChunks) return chunks
-
-    const modified = await onChunks(chunks, context)
+    const modified = await this._onChunks(chunks, context)
     return modified ?? chunks
   }
 
@@ -422,249 +342,339 @@ export class CodeRenderable extends TextBufferRenderable {
     }
   }
 
-  private async startHighlight(): Promise<void> {
-    const snapshot = this.captureHighlightSnapshot()
+  private startHighlight(): Promise<void> {
+    // streaming Markdown 走 persistent buffer 主路径；non-streaming 与非 Markdown 保持既有 one-shot。
+    if (this._streaming && this._filetype === "markdown") {
+      return this.startStreamingHighlight()
+    }
+    return this.startOneShotHighlight()
+  }
 
-    if (!snapshot.filetype) return
+  private releaseStreamingBuffer(): void {
+    const id = this._streamingBufferId
+    this._streamingBufferId = undefined
+    this._prefixCache = undefined
+    this._cachedHighlights = []
+    this._cacheGeneration++
+    if (id !== undefined) {
+      // 释放走当前持有该 buffer 的 client；在途响应会被标记 stale，不会进入提交路径。
+      // client 先于释放完成而被 destroy 时 dispose 请求会被拒绝，该关停竞态无可观察后果，但不能成为未处理 rejection。
+      void this._treeSitterClient.removeStreamingBuffer(id).catch(() => {})
+    }
+  }
 
-    const isInitialContent = snapshot.streaming && !this._hadInitialContent
+  protected override destroySelf(): void {
+    // Renderable.destroy 的统一清理钩子；buffer 释放与父类原生清理保持同一顺序。
+    this.releaseStreamingBuffer()
+    super.destroySelf()
+  }
+
+  private startStreamingHighlight(): Promise<void> {
+    // _hadInitialContent 与 ensureVisibleTextBeforeHighlight 的首帧可见性合同联动，两条路径都必须维护。
+    const isInitialContent = !this._hadInitialContent
     if (isInitialContent) {
       this._hadInitialContent = true
     }
 
     this._isHighlighting = true
-    const abortController = new AbortController()
-    this._highlightAbortController = abortController
+    // latest-wins 合并：active 期间到达的旧 pending 直接被最新内容替换，避免 one-shot 式队列堆积。
+    this._streamingPending = this._content
+    // highlightingDone 必须等“队列完全排空”，否则调用方会在最新内容尚未提交时就渲染。
+    if (this._streamingActive) return this._streamingIdle
+
+    this._streamingIdle = new Promise((resolve) => {
+      this._streamingIdleResolve = resolve
+    })
+    void this.runStreamingLoop()
+    return this._streamingIdle
+  }
+
+  private async runStreamingLoop(): Promise<void> {
+    // 任意时刻只有一个 loop 在跑；active 期间的更新全部通过 _streamingPending 合并进来。
+    this._streamingActive = true
+    try {
+      while (this._streamingPending !== undefined) {
+        const content = this._streamingPending
+        this._streamingPending = undefined
+        // snapshot 在取出内容时记录；之后的每个 await 点都要用它验证自己不是旧帧。
+        const snapshot = this._highlightSnapshotId
+
+        try {
+          if (this._streamingBufferId === undefined) {
+            // buffer 懒创建：首次内容到达时才占用 worker parser，非 Markdown 路径完全不涉及。
+            const id = await this._treeSitterClient.createStreamingBuffer(content, "markdown")
+            if (id === null) throw new Error("No markdown parser available for streaming buffer")
+            if (this.isDestroyed) {
+              // create 的在途窗口内 destroy 时 id 尚未登记，releaseStreamingBuffer 不会覆盖它；
+              // 必须就地释放，否则 worker 永久持有这颗 parser tree（INV-06）。
+              void this._treeSitterClient.removeStreamingBuffer(id).catch(() => {})
+              break
+            }
+            this._streamingBufferId = id
+          }
+
+          // onHighlight 存在时禁用前缀缓存，worker 必须返回全量 highlights（cacheEnd = 0）。
+          const cacheEnd = this._onHighlight ? 0 : (this._prefixCache?.end ?? 0)
+          const cacheGeneration = this._cacheGeneration
+          const result = await this._treeSitterClient.updateStreamingBuffer(this._streamingBufferId, content, cacheEnd)
+
+          // stale 响应只是 owner 转移的副产品，直接丢弃；它不是错误，不能进入 plain-text 兼容路径。
+          if (result.stale || this.isDestroyed) continue
+          // 每个 await 之后都必须重查 snapshot：等待期间内容可能已更新，旧快照提交即为错位帧。
+          if (snapshot !== this._highlightSnapshotId) {
+            this.requestRender()
+            continue
+          }
+          // 在途窗口内样式/回调 setter 已使缓存失效时，响应只携带裁剪后的 highlights；
+          // 提交它会把残缺数据重建为缓存，必须按 stale 丢弃，dirty 标志会驱动全量重取。
+          if (cacheGeneration !== this._cacheGeneration) {
+            this.requestRender()
+            continue
+          }
+
+          await this.commitStreamingResult(content, result, snapshot, cacheGeneration)
+        } catch (error) {
+          // 失败快照的唯一兼容行为：提交当前原文 plain text，不触发成功回调、不重试其他 parser。
+          if (snapshot !== this._highlightSnapshotId) {
+            this.requestRender()
+            continue
+          }
+          console.warn("Code streaming highlight failed, falling back to plain text:", error)
+          if (this.isDestroyed) continue
+          // 失败帧的缓存状态不再可信：丢弃后下一帧从全量转换重建。
+          this._prefixCache = undefined
+          this._cachedHighlights = []
+          this.textBuffer.setText(content)
+          this.setRenderedLineSources(undefined)
+          this.commitStreamingVisible()
+        }
+      }
+    } finally {
+      this._streamingActive = false
+      this._isHighlighting = false
+      const resolve = this._streamingIdleResolve
+      this._streamingIdleResolve = undefined
+      resolve?.()
+    }
+  }
+
+  private async commitStreamingResult(
+    content: string,
+    result: StreamingUpdateResult,
+    snapshot: number,
+    cacheGeneration: number,
+  ): Promise<void> {
+    const filetype = this._filetype
+    if (!filetype) return
+
+    // clipStart 与 worker 的裁剪点一致：之前的 highlights 稳定，之后的以当前响应为准。
+    const cacheEnd = this._onHighlight ? 0 : (this._prefixCache?.end ?? 0)
+    const clipStart = Math.min(result.changedStart, result.tailStart, cacheEnd)
+    // 增量合并还原全量 highlights：onHighlight 合同与 conceal 行映射都依赖完整范围。
+    this._cachedHighlights = [...this._cachedHighlights.filter((highlight) => highlight[1] <= clipStart), ...result.highlights]
+
+    let highlights = this._cachedHighlights
+    if (this._onHighlight) {
+      // onHighlight 始终收到完整当前 highlights；其任意 range 可能跨越切点，因此它存在时不复用前缀 chunk。
+      const modified = await this._onHighlight(highlights, {
+        content,
+        filetype,
+        syntaxStyle: this._syntaxStyle,
+      })
+      if (modified !== undefined) {
+        highlights = modified
+      }
+    }
+
+    if (snapshot !== this._highlightSnapshotId || cacheGeneration !== this._cacheGeneration) {
+      this.requestRender()
+      return
+    }
+    if (this.isDestroyed) return
+
+    const cache = this._prefixCache
+    let chunks: TextChunk[]
+    if (!this._onHighlight && cache && cache.end <= clipStart) {
+      // cache.end <= clipStart 表示缓存区间内没有任何变化或边界回退：沿用前缀 chunk，只转换 tail。
+      chunks = [...cache.chunks, ...this.convertHighlightRegion(content, highlights, cache.end, content.length)]
+      // 缓存随 tailStart 前移而扩展：[cache.end, tailStart) 这段刚闭合的 block 从此进入稳定前缀。
+      this._prefixCache = {
+        end: result.tailStart,
+        chunks: [...cache.chunks, ...this.convertHighlightRegion(content, highlights, cache.end, result.tailStart)],
+      }
+    } else {
+      // 缓存失效或不存在：全量转换一次并重建缓存，后续帧恢复增量。
+      chunks = this.convertHighlightRegion(content, highlights, 0, content.length)
+      this._prefixCache = this._onHighlight
+        ? undefined
+        : { end: result.tailStart, chunks: this.convertHighlightRegion(content, highlights, 0, result.tailStart) }
+    }
+
+    // onChunks 可能任意改写文本，conceal 行映射只在无 onChunks 时有效（与既有路径一致）。
+    const renderedLineSources = this._onChunks ? undefined : this.getConcealLinesSourceMap(content, highlights)
+
+    if (highlights.length > 0 || this._onChunks || this._baseHighlight) {
+      // onChunks 合同与既有路径相同：拿到的是 prefix+tail 拼接后的完整当前 chunk 流，不是局部 tail。
+      chunks = await this.transformChunks(chunks, { content, filetype, syntaxStyle: this._syntaxStyle, highlights })
+
+      if (snapshot !== this._highlightSnapshotId || cacheGeneration !== this._cacheGeneration) {
+        this.requestRender()
+        return
+      }
+      if (this.isDestroyed) return
+
+      this.textBuffer.setStyledText(new StyledText(chunks))
+      this.setRenderedLineSources(renderedLineSources)
+    } else {
+      this.textBuffer.setText(content)
+      this.setRenderedLineSources(undefined)
+    }
+
+    this.commitStreamingVisible()
+  }
+
+  private convertHighlightRegion(content: string, highlights: SimpleHighlight[], start: number, end: number): TextChunk[] {
+    // 全范围转换与既有 one-shot 走完全相同的调用，不经过 slice，避免两种路径产生任何行为分叉。
+    if (start === 0 && end === content.length) {
+      return treeSitterToTextChunks(content, highlights, this._syntaxStyle, {
+        enabled: this._conceal,
+        baseHighlight: this._baseHighlight,
+      })
+    }
+
+    // tailStart/cacheEnd 都是 block 起点，highlights 不跨切点，区域转换与全量转换逐位一致。
+    // 例外是 closing-fence synthetic newline：parse 域 highlight 可越过 source 末端，
+    // 全量路径靠 slice 自然截断它；区域转换也必须保留该 span，否则尾部会少一个空 chunk。
+    const crossesEnd = end < content.length
+    const regionHighlights: SimpleHighlight[] = []
+    for (const highlight of highlights) {
+      if (highlight[1] <= start || (crossesEnd && highlight[0] >= end)) continue
+      const clipped: SimpleHighlight = [
+        Math.max(highlight[0], start) - start,
+        (crossesEnd ? Math.min(highlight[1], end) : highlight[1]) - start,
+        highlight[2],
+      ]
+      if (highlight[3]) clipped.push(highlight[3])
+      regionHighlights.push(clipped)
+    }
+    return treeSitterToTextChunks(content.slice(start, end), regionHighlights, this._syntaxStyle, {
+      enabled: this._conceal,
+      baseHighlight: this._baseHighlight,
+    })
+  }
+
+  private commitStreamingVisible(): void {
+    // 与 one-shot 成功/失败提交使用同一组可见性标志，renderSelf 的后续行为不区分路径。
+    this._shouldRenderTextBuffer = true
+    this._highlightsDirty = false
+    this.updateTextInfo()
+    this.requestRender()
+  }
+
+  private async startOneShotHighlight(): Promise<void> {
+    const content = this._content
+    const filetype = this._filetype
+    const snapshotId = ++this._highlightSnapshotId
+
+    if (!filetype) return
+
+    const isInitialContent = this._streaming && !this._hadInitialContent
+    if (isInitialContent) {
+      this._hadInitialContent = true
+    }
+
+    this._isHighlighting = true
 
     try {
-      const markdownResult =
-        snapshot.streaming && snapshot.filetype === "markdown"
-          ? await this.highlightMarkdown(snapshot, abortController.signal)
-          : undefined
-      const result = markdownResult ?? (await this.highlightWithAbort(snapshot, abortController.signal))
+      const result = await this._treeSitterClient.highlightOnce(content, filetype)
 
-      if (!this.isCurrentSnapshot(snapshot)) {
-        if (markdownResult && this.canSeedMarkdownCache(snapshot)) {
-          // 旧快照只预热 raw cache；可见提交和 callbacks 仍由最新快照独占。
-          // 先把 boundary 推到当前文本，finally 才能判断应立即追赶还是进入 deferred 状态。
-          markdownResult.cache.boundary = advanceMarkdownBoundary(this._content, markdownResult.cache.boundary)
-          this._markdownHighlightCache = markdownResult.cache
-        }
+      if (snapshotId !== this._highlightSnapshotId) {
         this.requestRender()
         return
       }
 
-      if (markdownResult) {
-        this._markdownHighlightCache = markdownResult.cache
-      }
+      if (this.isDestroyed) return
 
-      let highlights = clipHighlights(result.highlights ?? [], snapshot.content.length)
+      let highlights = result.highlights ?? []
 
-      if (snapshot.onHighlight && highlights.length >= 0) {
+      if (this._onHighlight && highlights.length >= 0) {
         const context: HighlightContext = {
-          content: snapshot.content,
-          filetype: snapshot.filetype,
-          syntaxStyle: snapshot.syntaxStyle,
+          content,
+          filetype,
+          syntaxStyle: this._syntaxStyle,
         }
-        const modified = await snapshot.onHighlight(highlights, context)
-        if (!this.isCurrentSnapshot(snapshot)) {
-          this.requestRender()
-          return
-        }
+        const modified = await this._onHighlight(highlights, context)
         if (modified !== undefined) {
           highlights = modified
         }
       }
 
-      if (!this.isCurrentSnapshot(snapshot)) {
+      if (snapshotId !== this._highlightSnapshotId) {
         this.requestRender()
         return
       }
 
-      if (highlights.length > 0 || snapshot.onChunks || snapshot.baseHighlight) {
+      if (this.isDestroyed) return
+
+      if (highlights.length > 0) {
+        if (this._streaming) {
+          this._lastHighlights = highlights
+        }
+      }
+
+      if (highlights.length > 0 || this._onChunks || this._baseHighlight) {
         const context: ChunkRenderContext = {
-          content: snapshot.content,
-          filetype: snapshot.filetype,
-          syntaxStyle: snapshot.syntaxStyle,
+          content,
+          filetype,
+          syntaxStyle: this._syntaxStyle,
           highlights,
         }
 
-        let chunks = treeSitterToTextChunks(snapshot.content, highlights, snapshot.syntaxStyle, {
-          enabled: snapshot.conceal,
-          baseHighlight: snapshot.baseHighlight,
+        let chunks = treeSitterToTextChunks(content, highlights, this._syntaxStyle, {
+          enabled: this._conceal,
+          baseHighlight: this._baseHighlight,
         })
         // onChunks may rewrite text arbitrarily, so the conceal-only source map would be invalid.
-        const renderedLineSources = snapshot.onChunks
-          ? undefined
-          : this.getConcealLinesSourceMap(snapshot.content, highlights)
+        const renderedLineSources = this._onChunks ? undefined : this.getConcealLinesSourceMap(content, highlights)
 
-        chunks = await this.transformChunks(chunks, context, snapshot.onChunks)
+        chunks = await this.transformChunks(chunks, context)
 
-        if (!this.isCurrentSnapshot(snapshot)) {
+        if (snapshotId !== this._highlightSnapshotId) {
           this.requestRender()
           return
         }
+
+        if (this.isDestroyed) return
 
         const styledText = new StyledText(chunks)
         this.textBuffer.setStyledText(styledText)
         this.setRenderedLineSources(renderedLineSources)
       } else {
-        this.textBuffer.setText(snapshot.content)
+        this.textBuffer.setText(content)
         this.setRenderedLineSources(undefined)
       }
 
       this._shouldRenderTextBuffer = true
+      this._isHighlighting = false
       this._highlightsDirty = false
       this.updateTextInfo()
       this.requestRender()
     } catch (error) {
-      if (error instanceof Error && error.name === "TreeSitterWorkerTerminationError") {
-        // 终止失败不能把原文伪装成高亮成功；新快照到达前保持不可用并暂停自动重试。
-        this.markHighlightUnavailable(error)
-        return
-      }
-
-      if (abortController.signal.aborted || (error instanceof Error && error.name === "AbortError")) {
-        this.requestRender()
-        return
-      }
-
-      if (!this.isCurrentSnapshot(snapshot)) {
+      if (snapshotId !== this._highlightSnapshotId) {
         this.requestRender()
         return
       }
 
       console.warn("Code highlighting failed, falling back to plain text:", error)
-      this.textBuffer.setText(snapshot.content)
+      if (this.isDestroyed) return
+      this.textBuffer.setText(content)
       this.setRenderedLineSources(undefined)
       this._shouldRenderTextBuffer = true
+      this._isHighlighting = false
       this._highlightsDirty = false
       this.updateTextInfo()
       this.requestRender()
-    } finally {
-      if (this._highlightAbortController === abortController) {
-        this._highlightAbortController = undefined
-      }
-      this._isHighlighting = false
-      if (this._highlightsDirty && !this._highlightUnavailable && !this.isDestroyed) {
-        this.requestRender()
-        queueMicrotask(() => {
-          if (!this._isHighlighting && this._highlightsDirty && !this.isDestroyed) {
-            this.startDirtyHighlight()
-          }
-        })
-      }
     }
-  }
-
-  private markHighlightUnavailable(error: Error): void {
-    if (this.isDestroyed) return
-
-    const shouldNotify = !this._highlightUnavailable
-    this._highlightUnavailable = true
-    this._highlightsDirty = true
-    this.textBuffer.setText("Highlight unavailable")
-    this.setRenderedLineSources(undefined)
-    this._shouldRenderTextBuffer = true
-    this.updateTextInfo()
-    if (shouldNotify) {
-      console.error("Code highlighting unavailable after worker termination failed:", error)
-      this.emit("highlight-error", {
-        error,
-        content: this._content,
-        filetype: this._filetype ?? "",
-      } satisfies HighlightErrorEvent)
-    }
-    this.requestRender()
-  }
-
-  private async highlightMarkdown(snapshot: HighlightSnapshot, signal: AbortSignal): Promise<MarkdownHighlightResult> {
-    const content = snapshot.content
-    const frontmatterState = getFrontmatterState(content)
-    const previous = this._markdownHighlightCache
-    // boundary先于cache cut计算，确保reference/fence状态不会因复用旧stable prefix而倒退。
-    // 只有严格prefix且frontmatter语义一致时，历史highlights才有资格继续参与结果。
-    const boundary = advanceMarkdownBoundary(content, previous?.boundary)
-    const cut = markdownBoundaryCut(boundary)
-    const canReuse =
-      // stable prefix只有在frontmatter和文本prefix同时兼容时才可复用。
-      previous &&
-      content.startsWith(previous.content) &&
-      previous.frontmatterState === frontmatterState &&
-      cut >= previous.cut
-
-    let cachedCut = canReuse ? previous.cut : 0
-    let cachedHighlights = canReuse ? previous.highlights : []
-
-    if (cut > cachedCut) {
-      const segment = await this.highlightMarkdownFragment(snapshot, signal, content.slice(cachedCut, cut))
-      cachedHighlights = cachedHighlights.concat(shiftHighlights(segment, cachedCut))
-      cachedCut = cut
-    }
-
-    const tail = content.slice(cachedCut)
-    // tail始终保留完整上下文；只有boundary cut对应的closed prefix才允许单独复用。
-    const tailHighlights = tail.length === 0 ? [] : await this.highlightMarkdownFragment(snapshot, signal, tail)
-
-    return {
-      highlights: cachedHighlights.concat(shiftHighlights(tailHighlights, cachedCut)),
-      cache: {
-        content,
-        cut: cachedCut,
-        frontmatterState,
-        highlights: cachedHighlights,
-        boundary,
-        parsedLength: content.length,
-        parsedLines: boundary.lineCount,
-        parsedFenceStart: boundary.openFenceStart,
-      },
-    }
-  }
-
-  private canSeedMarkdownCache(snapshot: HighlightSnapshot): boolean {
-    // raw highlight cache 仍受全部可见语义输入约束，避免样式或 callback更新后复用旧快照。
-    // content 必须保持严格前缀关系；rewrite 的旧结果只能丢弃，不能成为新的 cache 起点。
-    return (
-      this._streaming &&
-      this._filetype === "markdown" &&
-      this._content.startsWith(snapshot.content) &&
-      this._treeSitterClient === snapshot.treeSitterClient &&
-      this._syntaxStyle === snapshot.syntaxStyle &&
-      this._conceal === snapshot.conceal &&
-      this._drawUnstyledText === snapshot.drawUnstyledText &&
-      this._baseHighlight === snapshot.baseHighlight &&
-      this._onHighlight === snapshot.onHighlight &&
-      this._onChunks === snapshot.onChunks
-    )
-  }
-
-  private shouldDeferMarkdownHighlight(): boolean {
-    // cache缺失时必须正常解析，不能让新的Markdown文档继承未知的deferred状态。
-    const cache = this._markdownHighlightCache
-    if (!cache || !this._streaming || this._filetype !== "markdown") return false
-    if (!this._content.startsWith(cache.content)) return false
-    // cache.content是最近一次真实解析的快照，任何rewrite都必须退出deferred路径。
-
-    const boundary = cache.boundary
-    if (boundary.openFenceStart === undefined || boundary.openFenceStart !== cache.parsedFenceStart) return false
-
-    // dirty 状态继续保留；只有阈值或合法 closer 到达才重新进入同一 full-context 主路径。
-    // parsedFenceStart 必须相同，否则新 opener需要立即解析，不能借前一个 fence的预算延迟。
-    return (
-      boundary.lineCount - cache.parsedLines < OPEN_FENCE_BATCH_LINES &&
-      this._content.length - cache.parsedLength < OPEN_FENCE_BATCH_CHARS
-    )
-  }
-
-  private async highlightMarkdownFragment(snapshot: HighlightSnapshot, signal: AbortSignal, content: string) {
-    const parseContent = content.length > 0 && !content.endsWith("\n") ? `${content}\n` : content
-    const result = await this.highlightWithAbort({ ...snapshot, content: parseContent }, signal)
-    return clipHighlights(result.highlights ?? [], content.length)
-  }
-
-  private highlightWithAbort(snapshot: HighlightSnapshot, signal: AbortSignal) {
-    // 取消结果由TreeSitterClient的worker生命周期owner返回，才能区分正常Abort和终止失败。
-    return snapshot.treeSitterClient.highlightOnce(snapshot.content, snapshot.filetype, signal)
   }
 
   private setRenderedLineSources(lineSources: number[] | undefined): void {
@@ -779,165 +789,24 @@ export class CodeRenderable extends TextBufferRenderable {
     return this.textBuffer.getLineHighlights(lineIdx)
   }
 
-  private startDirtyHighlight(): void {
-    if (this.isDestroyed || this._isHighlighting || this._highlightUnavailable || !this._highlightsDirty) return
-    // deferred返回时刻意不清除dirty；下一次append、closure或semantic setter仍能触发同一入口。
-    if (this.shouldDeferMarkdownHighlight()) return
-
-    if (this._content.length === 0) {
-      this._shouldRenderTextBuffer = false
-      this._highlightsDirty = false
-      return
-    }
-
-    if (!this._filetype) {
-      this._shouldRenderTextBuffer = true
-      this._highlightsDirty = false
-      return
-    }
-
-    this.ensureVisibleTextBeforeHighlight()
-    this._highlightsDirty = false
-    this._highlightingPromise = this.startHighlight()
-  }
-
   protected renderSelf(buffer: OptimizedBuffer): void {
     if (this._highlightsDirty) {
       if (this.isDestroyed) return
 
-      if (this._isHighlighting) {
-        // 先保留最新dirty snapshot；旧请求终止后由同一owner继续，避免并行worker/native提交。
+      if (this._content.length === 0) {
+        this._shouldRenderTextBuffer = false
+        this._highlightsDirty = false
+      } else if (!this._filetype) {
+        this._shouldRenderTextBuffer = true
+        this._highlightsDirty = false
       } else {
-        this.startDirtyHighlight()
+        this.ensureVisibleTextBeforeHighlight()
+        this._highlightsDirty = false
+        this._highlightingPromise = this.startHighlight()
       }
     }
 
     if (!this._shouldRenderTextBuffer) return
     super.renderSelf(buffer)
   }
-}
-
-function shiftHighlights(highlights: SimpleHighlight[], offset: number): SimpleHighlight[] {
-  if (offset === 0) return highlights
-  return highlights.map((highlight) => [highlight[0] + offset, highlight[1] + offset, highlight[2], highlight[3]])
-}
-
-function clipHighlights(highlights: SimpleHighlight[], length: number): SimpleHighlight[] {
-  return highlights.flatMap((highlight) => {
-    if (highlight[0] >= length) return []
-    if (highlight[1] <= length) return [highlight]
-    return [[highlight[0], length, highlight[2], highlight[3]]]
-  })
-}
-
-function advanceMarkdownBoundary(content: string, previous?: MarkdownBoundaryState): MarkdownBoundaryState {
-  // 只有 append-only caller会传入previous；长度回退时重建完整状态，避免复用错误cursor。
-  // 浅拷贝保护已完成parse的快照，后续append只能推进当前边界状态。
-  const state =
-    previous && previous.contentLength <= content.length
-      ? { ...previous }
-      : {
-          contentLength: 0,
-          scanOffset: 0,
-          lineCount: 0,
-          lastSafe: 0,
-          referenceBlocked: false,
-        }
-
-  let lineStart = state.scanOffset
-  // indexOf从cursor开始，保证长代码的同步边界成本只随新增suffix增长。
-  for (let newline = content.indexOf("\n", lineStart); newline !== -1; newline = content.indexOf("\n", lineStart)) {
-    // 只处理完整行；最后的partial line留给下次append，与closer的整行合同一致。
-    const line = content.slice(lineStart, newline)
-    const trimmed = line.trim()
-
-    if (state.lineCount === 0) {
-      // frontmatter只可能从文首开始；首行确定后，后续append不得重新解释历史文本。
-      const marker = /^(---|\+\+\+)\s*$/.exec(line)?.[1]
-      if (marker === "---" || marker === "+++") state.frontmatterMarker = marker
-    } else if (state.frontmatterMarker) {
-      // frontmatter未闭合前不解释fence/reference，避免YAML内容污染Markdown边界状态。
-      if (trimmed === state.frontmatterMarker) {
-        state.frontmatterMarker = undefined
-        state.frontmatterEnd = newline + 1
-        state.lastSafe = state.frontmatterEnd
-      }
-      state.lineCount++
-      lineStart = newline + 1
-      state.scanOffset = lineStart
-      continue
-    }
-
-    if (!state.frontmatterMarker) {
-      const marker = /^(`{3,}|~{3,})/.exec(trimmed)?.[1]
-      if (state.openFenceStart !== undefined) {
-        // closer 的 marker 后只能有空白；```text 在代码块内不能提前关闭 fence。
-        // marker字符和最短长度沿用opener，tilde/backtick不得互相关闭。
-        const closer = /^(`{3,}|~{3,})[ \t]*$/.exec(trimmed)?.[1]
-        if (closer && closer[0] === state.fenceMarker?.[0] && closer.length >= state.fenceMarker.length) {
-          state.openFenceStart = undefined
-          state.fenceMarker = undefined
-          state.fenceRollback = undefined
-        }
-      } else if (marker) {
-        // opener可以携带info string；只有closer才要求marker后纯空白。
-        state.openFenceStart = lineStart
-        state.fenceMarker = marker
-        // fence 内部的空行不能推进 stable prefix，回退点在 opener 到达时就固定。
-        state.fenceRollback = state.lastSafe
-      } else if (hasReferenceUsage(line)) {
-        // 后续 definition仍可能改变 usage 语义，之后的 append 只能扫描状态而不能推进 cut。
-        // 该冻结是保守且单向的，直到rewrite或semantic invalidation重建cache。
-        state.referenceBlocked = true
-      } else if (!state.referenceBlocked && trimmed === "") {
-        // 空行只在fence/reference之外推进stable cut，保证后续block仍有完整上下文。
-        state.lastSafe = newline + 1
-      }
-    }
-
-    state.lineCount++
-    // 每次循环都推进cursor和lineCount，保证同一suffix不会被下一帧重复消费。
-    lineStart = newline + 1
-    state.scanOffset = lineStart
-  }
-
-  state.contentLength = content.length
-  return state
-}
-
-function markdownBoundaryCut(state: MarkdownBoundaryState): number {
-  // open frontmatter必须保留全文上下文；closed frontmatter才可成为最早稳定前缀。
-  if (state.frontmatterMarker) return 0
-  // open fence内部即使出现空行，也只能回到opener到达前记录的rollback点。
-  if (state.openFenceStart !== undefined) return Math.min(state.lastSafe, state.fenceRollback ?? state.lastSafe)
-  // frontmatter关闭位置是独立的稳定边界，不能被后续普通Markdown空行覆盖。
-  if (state.frontmatterEnd !== undefined) return Math.max(state.frontmatterEnd, state.lastSafe)
-  // reference冻结或普通文本都从最近确认的完整空行结束，绝不切入partial line。
-  // 这个返回值是stable-prefix cache唯一的边界来源，不能由tail highlights反向推断。
-  return state.lastSafe
-}
-
-function hasReferenceUsage(line: string): boolean {
-  if (/^\s{0,3}\[[^\]\n]+\]:/.test(line)) return false
-
-  const match = /!?\[[^\]\n]+\](?:\[[^\]\n]*\])?/.exec(line)
-  if (!match) return false
-
-  const next = line[match.index + match[0].length]
-  return next !== "(" && next !== ":"
-}
-
-function getFrontmatterState(content: string): number {
-  const marker = content.match(/^(---|\+\+\+)\s*(\n|$)/)?.[1]
-  if (!marker) return -1
-
-  const lines = content.split("\n")
-  let offset = lines[0].length + 1
-  for (let index = 1; index < lines.length; index++) {
-    const line = lines[index]
-    if (line.trim() === marker) return Math.min(content.length, offset + line.length + 1)
-    offset += line.length + 1
-  }
-
-  return 0
 }

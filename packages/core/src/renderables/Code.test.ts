@@ -1,9 +1,11 @@
-import { test, expect, beforeEach, afterEach, spyOn } from "bun:test"
+import { test, expect, beforeEach, afterEach } from "bun:test"
 import { CodeRenderable } from "./Code.js"
 import { SyntaxStyle } from "../syntax-style.js"
 import { RGBA } from "../lib/RGBA.js"
 import { createTestRenderer, type TestRenderer, MockTreeSitterClient, type MockMouse } from "../testing.js"
 import { ManualClock } from "../testing/manual-clock.js"
+import { tmpdir } from "os"
+import { join } from "path"
 import { TreeSitterClient } from "../lib/tree-sitter/index.js"
 import type { SimpleHighlight } from "../lib/tree-sitter/types.js"
 import { BoxRenderable } from "./Box.js"
@@ -186,14 +188,15 @@ test("CodeRenderable - re-highlights when content changes during active highligh
   expect(codeRenderable.content).toBe("let newMessage = 'world';")
 
   await renderOnce()
-  await flushAsync()
-  await renderOnce()
   expect(mockClient.isHighlighting()).toBe(true)
 
   mockClient.resolveHighlightOnce(0)
   await flushAsync()
   await renderOnce()
 
+  expect(mockClient.isHighlighting()).toBe(true)
+
+  mockClient.resolveHighlightOnce(0)
   await waitForHighlight(codeRenderable)
 
   expect(mockClient.isHighlighting()).toBe(false)
@@ -228,8 +231,6 @@ test("CodeRenderable - multiple content changes during highlighting", async () =
   expect(codeRenderable.content).toBe("final content")
 
   await renderOnce()
-  await flushAsync()
-  await renderOnce()
   expect(mockClient.isHighlighting()).toBe(true)
 
   mockClient.resolveHighlightOnce(0)
@@ -237,6 +238,9 @@ test("CodeRenderable - multiple content changes during highlighting", async () =
   await flushAsync()
   await renderOnce()
 
+  expect(mockClient.isHighlighting()).toBe(true)
+
+  mockClient.resolveHighlightOnce(0)
   await waitForHighlight(codeRenderable)
 
   expect(mockClient.isHighlighting()).toBe(false)
@@ -291,69 +295,6 @@ test("CodeRenderable - uses fallback rendering when highlighting throws error", 
   expect(codeRenderable.content).toBe("const message = 'hello world';")
   expect(codeRenderable.filetype).toBe("javascript")
   expect(codeRenderable.plainText).toBe("const message = 'hello world';")
-})
-
-test("CodeRenderable - reports unavailable highlighting after worker termination failure", async () => {
-  const syntaxStyle = SyntaxStyle.fromStyles({
-    default: { fg: RGBA.fromValues(1, 1, 1, 1) },
-  })
-  const errorSpy = spyOn(console, "error").mockImplementation(() => {})
-  const mockClient = new MockTreeSitterClient()
-  const error = new Error("termination rejected")
-  error.name = "TreeSitterWorkerTerminationError"
-  let highlightCalls = 0
-  mockClient.highlightOnce = async (_content, _filetype, signal) => {
-    highlightCalls++
-    if (highlightCalls > 1) return { highlights: [] }
-    return new Promise((_, reject) => {
-      signal?.addEventListener("abort", () => reject(error), { once: true })
-    })
-  }
-  const diagnostics: Array<{ error: Error; content: string; filetype: string }> = []
-  let highlightCallbackCalls = 0
-  let chunksCallbackCalls = 0
-
-  const codeRenderable = new CodeRenderable(currentRenderer, {
-    id: "test-code",
-    content: "const message = 'hello world';",
-    filetype: "javascript",
-    syntaxStyle,
-    treeSitterClient: mockClient,
-    conceal: false,
-    onHighlight: (highlights) => {
-      highlightCallbackCalls++
-      return highlights
-    },
-    onChunks: (chunks) => {
-      chunksCallbackCalls++
-      return chunks
-    },
-  })
-  codeRenderable.on("highlight-error", (event: { error: Error; content: string; filetype: string }) => {
-    diagnostics.push(event)
-  })
-
-  currentRenderer.root.add(codeRenderable)
-  await renderOnce()
-  codeRenderable.content = "const next = true;"
-  await waitForHighlight(codeRenderable)
-
-  expect(errorSpy).toHaveBeenCalledWith("Code highlighting unavailable after worker termination failed:", error)
-  expect(codeRenderable.highlightUnavailable).toBe(true)
-  expect(codeRenderable.plainText).toBe("Highlight unavailable")
-  expect(diagnostics).toEqual([{ error, content: "const next = true;", filetype: "javascript" }])
-  expect(highlightCallbackCalls).toBe(0)
-  expect(chunksCallbackCalls).toBe(0)
-
-  codeRenderable.content = "const retry = true;"
-  await renderOnce()
-  await waitForHighlight(codeRenderable)
-
-  expect(codeRenderable.highlightUnavailable).toBe(false)
-  expect(codeRenderable.plainText).toBe("const retry = true;")
-  expect(highlightCallbackCalls).toBe(1)
-  expect(chunksCallbackCalls).toBe(1)
-  errorSpy.mockRestore()
 })
 
 test("CodeRenderable - handles empty content", async () => {
@@ -600,7 +541,6 @@ test("CodeRenderable - continues highlighting after unresolved promise", async (
     async highlightOnce(
       content: string,
       filetype: string,
-      signal?: AbortSignal,
     ): Promise<{ highlights?: SimpleHighlight[]; warning?: string; error?: string }> {
       highlightCount++
 
@@ -609,17 +549,7 @@ test("CodeRenderable - continues highlighting after unresolved promise", async (
       pendingPromises.push({ content, filetype, never: shouldHang })
 
       if (shouldHang) {
-        return new Promise((_, reject) => {
-          signal?.addEventListener(
-            "abort",
-            () => {
-              const error = new Error("TreeSitter highlight aborted")
-              error.name = "AbortError"
-              reject(error)
-            },
-            { once: true },
-          )
-        })
+        return new Promise(() => {})
       }
 
       return Promise.resolve({ highlights: [] })
@@ -1063,7 +993,6 @@ test("CodeRenderable - with drawUnstyledText=false, multiple updates only render
   const frameAfterUpdate = captureFrame()
   expect(frameAfterUpdate.trim()).toBe("")
 
-  await flushAsync()
   mockClient.resolveAllHighlightOnce()
   await waitForHighlight(codeRenderable)
   await renderOnce()
@@ -1648,65 +1577,6 @@ test("CodeRenderable - onHighlight callback supports async functions", async () 
   expect(asyncHighlight).toBeDefined()
 })
 
-test("CodeRenderable - invalidates an active highlight when onHighlight changes", async () => {
-  const syntaxStyle = SyntaxStyle.fromStyles({
-    default: { fg: RGBA.fromValues(1, 1, 1, 1) },
-    keyword: { fg: RGBA.fromValues(0, 0, 1, 1) },
-    stale: { fg: RGBA.fromValues(1, 0, 0, 1) },
-  })
-
-  const mockClient = new MockTreeSitterClient()
-  mockClient.setMockResult({
-    highlights: [[0, 5, "keyword"]] as SimpleHighlight[],
-  })
-  const entered = Promise.withResolvers<void>()
-  const release = Promise.withResolvers<void>()
-  const observedGroups: string[][] = []
-
-  const codeRenderable = new CodeRenderable(currentRenderer, {
-    id: "test-code",
-    content: "const value = 1;",
-    filetype: "javascript",
-    syntaxStyle,
-    treeSitterClient: mockClient,
-    onHighlight: async (highlights) => {
-      entered.resolve()
-      await release.promise
-      return [...highlights, [0, 5, "stale"] as SimpleHighlight]
-    },
-  })
-
-  currentRenderer.root.add(codeRenderable)
-  await renderOnce()
-  mockClient.resolveHighlightOnce()
-  await flushAsync()
-  await entered.promise
-
-  codeRenderable.onHighlight = (highlights) => highlights
-  codeRenderable.onChunks = (_chunks, context) => {
-    observedGroups.push(context.highlights.map((highlight) => highlight[2]))
-    return _chunks
-  }
-  release.resolve()
-  await renderOnce()
-  await flushAsync()
-  if (mockClient.isHighlighting()) {
-    mockClient.resolveAllHighlightOnce()
-  }
-  await waitForHighlight(codeRenderable)
-
-  expect(observedGroups.flat()).not.toContain("stale")
-
-  await renderOnce()
-  if (mockClient.isHighlighting()) {
-    mockClient.resolveAllHighlightOnce()
-    await waitForHighlight(codeRenderable)
-    await renderOnce()
-  }
-
-  expect(observedGroups.flat()).not.toContain("stale")
-})
-
 test("CodeRenderable - streaming mode caches highlights between updates", async () => {
   const syntaxStyle = SyntaxStyle.fromStyles({
     default: { fg: RGBA.fromValues(1, 1, 1, 1) },
@@ -1748,247 +1618,6 @@ test("CodeRenderable - streaming mode caches highlights between updates", async 
 
   expect(codeRenderable.content).toBe("const final = 'done';")
   expect(codeRenderable.plainText).toBe("const final = 'done';")
-})
-
-test("CodeRenderable - settles a closed Markdown prefix without reparsing the full document", async () => {
-  const syntaxStyle = SyntaxStyle.fromStyles({
-    default: { fg: RGBA.fromValues(1, 1, 1, 1) },
-    keyword: { fg: RGBA.fromValues(0, 0, 1, 1) },
-  })
-
-  class SizedMarkdownClient extends TreeSitterClient {
-    constructor() {
-      super({ dataPath: "/tmp/mock" }, { autoStartWorker: false })
-    }
-
-    override highlightOnce(
-      content: string,
-      _filetype: string,
-      signal?: AbortSignal,
-    ): Promise<{ highlights: SimpleHighlight[] }> {
-      const delay = content.length >= 150 ? 1000 : 20
-      return new Promise((resolve, reject) => {
-        const timeout = setTimeout(() => {
-          signal?.removeEventListener("abort", abort)
-          const highlights = Array.from(
-            content.matchAll(/const/g),
-            (match) => [match.index!, match.index! + match[0].length, "keyword"] as SimpleHighlight,
-          )
-          resolve({ highlights })
-        }, delay)
-        const abort = () => {
-          clearTimeout(timeout)
-          reject(Object.assign(new Error("aborted"), { name: "AbortError" }))
-        }
-        signal?.addEventListener("abort", abort, { once: true })
-      })
-    }
-  }
-
-  const firstBlock = "const first = 1;\n\n"
-  const secondBlock = `const second = 2;\n${"stable text ".repeat(10)}\n\n`
-  const codeRenderable = new CodeRenderable(currentRenderer, {
-    id: "test-markdown-cache",
-    content: firstBlock,
-    filetype: "markdown",
-    syntaxStyle,
-    treeSitterClient: new SizedMarkdownClient(),
-    streaming: true,
-    drawUnstyledText: false,
-  })
-
-  currentRenderer.root.add(codeRenderable)
-  await renderOnce()
-  await waitForHighlight(codeRenderable)
-
-  const startedAt = performance.now()
-  codeRenderable.content = firstBlock + secondBlock
-  await renderOnce()
-  await waitForHighlight(codeRenderable)
-
-  expect(performance.now() - startedAt).toBeLessThan(500)
-  expect(codeRenderable.plainText).toContain("const first = 1;")
-  expect(codeRenderable.plainText).toContain("const second = 2;")
-})
-
-test("CodeRenderable - defers tiny open-fence appends until the batch threshold", async () => {
-  // 该测试观察公共 highlightingDone 和最终 plainText，不依赖私有 cache 字段或 worker调用次数。
-  const syntaxStyle = SyntaxStyle.fromStyles({
-    default: { fg: RGBA.fromValues(1, 1, 1, 1) },
-  })
-
-  class DeferredFenceClient extends MockTreeSitterClient {
-    private _nextHighlight?: (result: { highlights: SimpleHighlight[] }) => void
-
-    override highlightOnce(content: string, filetype: string, signal?: AbortSignal) {
-      if (content.length < 100) return super.highlightOnce(content, filetype, signal)
-      return new Promise<{ highlights: SimpleHighlight[] }>((resolve) => {
-        this._nextHighlight = resolve
-      })
-    }
-
-    resolveNextHighlight() {
-      this._nextHighlight?.({ highlights: [] })
-      this._nextHighlight = undefined
-    }
-
-    override isHighlighting() {
-      return this._nextHighlight !== undefined || super.isHighlighting()
-    }
-  }
-
-  const client = new DeferredFenceClient()
-  const initial = "```ts\n" + "const value = 1;\n".repeat(6)
-  const codeRenderable = new CodeRenderable(currentRenderer, {
-    id: "test-open-fence-batch",
-    content: initial,
-    filetype: "markdown",
-    syntaxStyle,
-    treeSitterClient: client,
-    streaming: true,
-    drawUnstyledText: false,
-  })
-
-  currentRenderer.root.add(codeRenderable)
-  // 初次open fence仍需完整解析，后续门槛只能建立在已有正确frame之上。
-  await renderOnce()
-  client.resolveNextHighlight()
-  await waitForHighlight(codeRenderable)
-
-  let settled = false
-  codeRenderable.highlightingDone.then(() => {
-    settled = true
-  })
-  codeRenderable.content = initial + "const tiny = true;\n"
-  await renderOnce()
-  await flushAsync()
-
-  // 未达到门槛时保留最近正确frame，避免 drawUnstyledText=false的消费者看到伪高亮结果。
-  expect(settled).toBe(true)
-  expect(client.isHighlighting()).toBe(false)
-  // deferred frame不承诺新增字符已经着色，只承诺不会提交错误的半解析结果。
-  // 这保留了drawUnstyledText=false路径的既有可见性，而不是引入raw text fallback。
-  expect(codeRenderable.plainText).toBe(initial)
-
-  codeRenderable.content = initial + "const tiny = true;\n" + "const threshold = true;\n".repeat(32)
-  await renderOnce()
-  await flushAsync()
-
-  // 跨过32行后必须重新进入同一full-context解析路径，而不是永久冻结dirty状态。
-  expect(client.isHighlighting()).toBe(true)
-  // 阈值跨越必须恢复dirty continuation，否则小append的保护会变成永久停滞。
-  // 测试通过公共client promise释放解析，避免绑定Code的内部cache表示。
-  client.resolveNextHighlight()
-  // completion后dirty必须清除，避免下一帧重复提交同一个threshold snapshot。
-  await waitForHighlight(codeRenderable)
-})
-
-test("CodeRenderable - keeps an active Markdown request across append-only updates", async () => {
-  // append-only更新只推进latest dirty；旧请求完成后不能执行旧snapshot callback。
-  const syntaxStyle = SyntaxStyle.fromStyles({
-    default: { fg: RGBA.fromValues(1, 1, 1, 1) },
-  })
-  const client = new MockTreeSitterClient()
-  const initial = "# First\n\n"
-  const latest = initial + "Second paragraph.\n\n"
-  const observedContents: string[] = []
-  const codeRenderable = new CodeRenderable(currentRenderer, {
-    id: "test-markdown-active-append",
-    content: initial,
-    filetype: "markdown",
-    syntaxStyle,
-    treeSitterClient: client,
-    streaming: true,
-    drawUnstyledText: false,
-    onHighlight: (highlights, context) => {
-      observedContents.push(context.content)
-      return highlights
-    },
-  })
-
-  currentRenderer.root.add(codeRenderable)
-  // 首个请求故意保持pending，用来观察append是否错误触发semantic abort。
-  await renderOnce()
-  expect(client.isHighlighting()).toBe(true)
-
-  codeRenderable.content = latest
-  await flushAsync()
-  // active worker仍在工作，证明正常delta没有走semantic termination路径。
-  // 如果setter错误地abort，mock会移除pending promise，这个公共状态会立即变成false。
-  expect(client.isHighlighting()).toBe(true)
-
-  client.resolveHighlightOnce()
-  // 旧结果完成后只允许latest snapshot继续执行公开callback。
-  await waitForHighlight(codeRenderable)
-  await renderOnce()
-  client.resolveAllHighlightOnce()
-  // replay后的latest结果通过同一公共promise完成，不要求测试知道内部job结构。
-  await waitForHighlight(codeRenderable)
-  await renderOnce()
-
-  expect(codeRenderable.content).toBe(latest)
-  expect(codeRenderable.plainText).toBe(latest)
-  // 只有latest snapshot可以触发公开onHighlight语义。
-  // stale raw cache可以内部复用，但旧snapshot不能泄漏到公开callback上下文。
-  // 该断言同时保护latest dirty的callback顺序和旧结果抑制边界。
-  expect(observedContents).toEqual([latest])
-})
-
-test("CodeRenderable - streaming Markdown matches a full parse across tables, fences and formulas", async () => {
-  // 逐delta结果必须与独立full parse相同，尤其验证伪closer不会提前冻结stable prefix。
-  const syntaxStyle = SyntaxStyle.fromStyles({
-    default: { fg: RGBA.fromValues(1, 1, 1, 1) },
-  })
-  const client = new TreeSitterClient({ dataPath: "/tmp/opentui-code-markdown-stream-test" })
-  const chunks = [
-    "| Name | Value |\n",
-    "| ---- | ----- |\n| alpha | $x$ |\n\n",
-    "See [foo]\n\n",
-    "[foo]: https://example.com\n\n",
-    "```ts\n",
-    "const value = 1;\n",
-    "```not-a-closing-marker\n",
-    "```\n\n",
-    "Inline $$a\nb$$\n",
-  ]
-  let content = ""
-  let latestHighlights: SimpleHighlight[] = []
-
-  const codeRenderable = new CodeRenderable(currentRenderer, {
-    id: "test-markdown-differential",
-    content,
-    filetype: "markdown",
-    syntaxStyle,
-    treeSitterClient: client,
-    streaming: true,
-    conceal: false,
-    onHighlight: (highlights) => {
-      latestHighlights = highlights
-      return highlights
-    },
-  })
-
-  currentRenderer.root.add(codeRenderable)
-
-  try {
-    for (const chunk of chunks) {
-      content += chunk
-      codeRenderable.content = content
-      await renderOnce()
-      await waitForHighlight(codeRenderable)
-      await renderOnce()
-    }
-
-    const expected = await client.highlightOnce(content, "markdown")
-    // independent client full parse是结构正确性的oracle，不复制Code的cache算法。
-    expect(latestHighlights).toEqual(expected.highlights ?? [])
-    expect(codeRenderable.plainText).toContain("| alpha | $x$ |")
-    expect(codeRenderable.plainText).toContain("const value = 1;")
-    expect(codeRenderable.plainText).toContain("```not-a-closing-marker")
-    expect(codeRenderable.plainText).toContain("Inline $$a\nb$$")
-  } finally {
-    await client.destroy()
-  }
 })
 
 test("CodeRenderable - streaming mode works with large content updates", async () => {
@@ -2540,7 +2169,6 @@ test("CodeRenderable - plainText reflects content immediately with drawUnstyledT
   const frame = captureFrame()
   expect(frame.trim()).toBe("")
 
-  await flushAsync()
   mockClient.resolveAllHighlightOnce()
   await waitForHighlight(codeRenderable)
   await renderOnce()
@@ -2759,4 +2387,605 @@ test("CodeRenderable - streaming with drawUnstyledText=false falls back to unsty
   await renderOnce()
 
   expect(codeRenderable.plainText).toBe("const updated = 'world';")
+})
+
+const createRealMarkdownClient = async () => {
+  // 差分 oracle 使用真实 parser：streaming 结果必须与同内容的独立 full render 逐帧一致。
+  const client = new TreeSitterClient({ dataPath: join(tmpdir(), "tree-sitter-shared-test-data") })
+  await client.initialize()
+  await client.preloadParser("markdown")
+  return client
+}
+
+const streamingSyntaxStyle = () =>
+  SyntaxStyle.fromStyles({
+    default: { fg: RGBA.fromValues(1, 1, 1, 1) },
+    "markup.heading.1": { fg: RGBA.fromValues(0, 0, 1, 1) },
+    "markup.raw": { fg: RGBA.fromValues(0, 1, 0, 1) },
+    keyword: { fg: RGBA.fromValues(1, 0, 0, 1) },
+  })
+
+// 样式差分必须覆盖 chunk 文本、前景/背景色与 attributes：只比 plainText 会让陈旧高亮完全隐身。
+const serializeChunks = (chunks: { text: string; fg?: unknown; bg?: unknown; attributes?: number }[]) =>
+  JSON.stringify(chunks.map((chunk) => [chunk.text, chunk.fg, chunk.bg, chunk.attributes ?? 0]))
+
+test("CodeRenderable streaming markdown - reuses one managed buffer across appends and rewrites", async () => {
+  // 该测试锁定 INV-02 的核心行为：一个流只创建一个 persistent buffer，append 与 rewrite 都复用它。
+  const mockClient = new MockTreeSitterClient()
+  mockClient.setStreamingResultHandler((content) => ({
+    version: 1,
+    changedStart: content.length,
+    // tailStart 必须遵守“最后一个 render block 始终属于 tail”的同一不变量；
+    // 取内容末端会把陈旧文本认证进前缀缓存，mock 也不能违反它。
+    tailStart: 0,
+    highlights: [],
+  }))
+
+  const codeRenderable = new CodeRenderable(currentRenderer, {
+    id: "streaming-md",
+    content: "# Title\n",
+    filetype: "markdown",
+    syntaxStyle: streamingSyntaxStyle(),
+    treeSitterClient: mockClient,
+    streaming: true,
+    // 与 Reasoning/TextPart 的真实用法一致：高亮完成前不显示未高亮文本。
+    drawUnstyledText: false,
+    left: 0,
+    top: 0,
+  })
+
+  currentRenderer.root.add(codeRenderable)
+  await renderOnce()
+  // 每一帧都等待 highlightingDone 再渲染，与真实 consumer 的可见性顺序一致。
+  await waitForHighlight(codeRenderable)
+  await renderOnce()
+
+  // append 是流式主路径；此处若新建 buffer，说明 active/latest 调度失效。
+  codeRenderable.content = "# Title\n\nfirst paragraph\n"
+  await renderOnce()
+  await waitForHighlight(codeRenderable)
+  await renderOnce()
+
+  // rewrite 也必须复用同一个 buffer，而不是新建或回退 one-shot。
+  codeRenderable.content = "completely rewritten\n"
+  await renderOnce()
+  await waitForHighlight(codeRenderable)
+  await renderOnce()
+
+  // persistent path 的核心收益就是一个 parser tree 贯穿整个流；多次创建即意味着设计回退。
+  expect(mockClient.createdStreamingBuffers.length).toBe(1)
+  // rewrite 后的可见文本必须是新内容，证明 worker 的任意 diff 更新正确生效。
+  expect(codeRenderable.plainText).toBe("completely rewritten\n")
+})
+
+test("CodeRenderable streaming markdown - filetype change releases old buffer before switching grammar", async () => {
+  // filetype setter 是 grammar owner 转移而不是 generic reset；该顺序防止 worker 用错语法树。
+  const mockClient = new MockTreeSitterClient()
+  mockClient.setMockResult({ highlights: [] })
+
+  const codeRenderable = new CodeRenderable(currentRenderer, {
+    id: "streaming-md-filetype",
+    content: "# Title\n",
+    filetype: "markdown",
+    syntaxStyle: streamingSyntaxStyle(),
+    treeSitterClient: mockClient,
+    streaming: true,
+    drawUnstyledText: false,
+    left: 0,
+    top: 0,
+  })
+
+  currentRenderer.root.add(codeRenderable)
+  await renderOnce()
+  await waitForHighlight(codeRenderable)
+  await renderOnce()
+
+  const oldBufferId = mockClient.createdStreamingBuffers[0]?.id
+  // 先证明 buffer 已创建，后面的释放断言才有意义。
+  expect(oldBufferId).toBeDefined()
+
+  // 切换到非 Markdown grammar：persistent buffer 必须释放，后续高亮回退到既有 one-shot。
+  codeRenderable.filetype = "javascript"
+  await renderOnce()
+  // 非 Markdown 走既有 one-shot 路径；mock 需要手动放行结果。
+  mockClient.resolveHighlightOnce(0)
+  await waitForHighlight(codeRenderable)
+  await renderOnce()
+
+  // grammar 转移前必须先释放旧 owner 的 buffer，否则 worker 会持有错误语法的 tree。
+  expect(mockClient.removedStreamingBuffers).toContain(oldBufferId)
+  expect(codeRenderable.plainText).toBe("# Title\n")
+})
+
+test("CodeRenderable streaming markdown - replacing the client releases the buffer through the old client", async () => {
+  // 公开 setter 允许运行中换 client；buffer 归属旧 client，必须经旧 client 释放而不是被带走。
+  const firstClient = new MockTreeSitterClient()
+  const secondClient = new MockTreeSitterClient()
+
+  const codeRenderable = new CodeRenderable(currentRenderer, {
+    id: "streaming-md-client",
+    content: "# Title\n",
+    filetype: "markdown",
+    syntaxStyle: streamingSyntaxStyle(),
+    treeSitterClient: firstClient,
+    streaming: true,
+    drawUnstyledText: false,
+    left: 0,
+    top: 0,
+  })
+
+  currentRenderer.root.add(codeRenderable)
+  await renderOnce()
+  await waitForHighlight(codeRenderable)
+  await renderOnce()
+
+  const oldBufferId = firstClient.createdStreamingBuffers[0]?.id
+  // 切换 client 后立即追加内容：新 buffer 必须携带最新内容重建，而不是等待下一次自然更新。
+  codeRenderable.treeSitterClient = secondClient
+  codeRenderable.content = "# Title\n\nmore\n"
+  await renderOnce()
+  await waitForHighlight(codeRenderable)
+  await renderOnce()
+
+  // client 替换是 owner 转移：旧 client 释放、新 client 重建，二者缺一不可。
+  expect(firstClient.removedStreamingBuffers).toContain(oldBufferId)
+  expect(secondClient.createdStreamingBuffers.length).toBe(1)
+  // 新 client 上的渲染必须反映最新内容，证明转移后快照没有回退。
+  expect(codeRenderable.plainText).toBe("# Title\n\nmore\n")
+})
+
+test("CodeRenderable streaming markdown - destroy during in-flight create still releases the buffer", async () => {
+  // INV-06 的竞态形态：create 跨越 worker 初始化窗口时 destroy，id 尚未登记也必须被释放。
+  const mockClient = new MockTreeSitterClient()
+  mockClient.streamingCreateAutoResolve = false
+
+  const codeRenderable = new CodeRenderable(currentRenderer, {
+    id: "streaming-md-destroy-race",
+    content: "# Title\n",
+    filetype: "markdown",
+    syntaxStyle: streamingSyntaxStyle(),
+    treeSitterClient: mockClient,
+    streaming: true,
+    drawUnstyledText: false,
+    left: 0,
+    top: 0,
+  })
+
+  currentRenderer.root.add(codeRenderable)
+  await renderOnce()
+  await flushAsync()
+  codeRenderable.destroy()
+
+  // create 在 destroy 之后才完成：释放责任不随登记窗口消失。
+  mockClient.resolveStreamingCreate(0)
+  await flushAsync()
+
+  expect(mockClient.createdStreamingBuffers.length).toBe(1)
+  expect(mockClient.removedStreamingBuffers).toContain(mockClient.createdStreamingBuffers[0]?.id)
+})
+
+test("CodeRenderable streaming markdown - destroy releases the managed buffer", async () => {
+  // INV-06 的生命周期合同：renderable 销毁时 worker 不得保留孤儿 parser tree。
+  const mockClient = new MockTreeSitterClient()
+
+  const codeRenderable = new CodeRenderable(currentRenderer, {
+    id: "streaming-md-destroy",
+    content: "# Title\n",
+    filetype: "markdown",
+    syntaxStyle: streamingSyntaxStyle(),
+    treeSitterClient: mockClient,
+    streaming: true,
+    drawUnstyledText: false,
+    left: 0,
+    top: 0,
+  })
+  // 先完成一次成功高亮，确保 buffer 已建立，再验证 destroy 的释放行为。
+
+  currentRenderer.root.add(codeRenderable)
+  await renderOnce()
+  await waitForHighlight(codeRenderable)
+  await renderOnce()
+
+  const bufferId = mockClient.createdStreamingBuffers[0]?.id
+  // destroy 后不再渲染；释放断言不依赖任何后续帧。
+  codeRenderable.destroy()
+  // destroy 是 buffer 生命周期的终点；泄漏会让 worker 持有不再使用的 parser tree。
+  expect(mockClient.removedStreamingBuffers).toContain(bufferId)
+})
+
+test("CodeRenderable streaming markdown - stale response after ownership transfer is never committed", async () => {
+  // INV-04 的版本门：owner 转移后在途响应不得把旧内容/旧样式提交到可见区。
+  const firstClient = new MockTreeSitterClient()
+  firstClient.streamingAutoResolve = false
+  // 旧响应带有明显样式与旧内容；若被提交，plainText 或样式都会回退。
+  firstClient.setStreamingResultHandler((content) => ({
+    version: 1,
+    changedStart: 0,
+    tailStart: 0,
+    highlights: [[0, 5, "markup.heading.1"]],
+  }))
+  const secondClient = new MockTreeSitterClient()
+  secondClient.setStreamingResultHandler((content) => ({
+    version: 1,
+    changedStart: content.length,
+    tailStart: 0,
+    highlights: [],
+  }))
+
+  const codeRenderable = new CodeRenderable(currentRenderer, {
+    id: "streaming-md-stale",
+    content: "first\n",
+    filetype: "markdown",
+    syntaxStyle: streamingSyntaxStyle(),
+    treeSitterClient: firstClient,
+    streaming: true,
+    drawUnstyledText: false,
+    left: 0,
+    top: 0,
+  })
+
+  currentRenderer.root.add(codeRenderable)
+  await renderOnce()
+  expect(firstClient.pendingStreamingUpdates()).toBe(1)
+
+  // owner 转移会让在途响应变成 stale；它绝不允许把旧内容 "first\n" 提交到可见区。
+  codeRenderable.treeSitterClient = secondClient
+  codeRenderable.content = "second\n"
+  await renderOnce()
+  await waitForHighlight(codeRenderable)
+  await renderOnce()
+
+  expect(codeRenderable.plainText).toBe("second\n")
+})
+
+test("CodeRenderable streaming markdown - style setter during in-flight update never commits a clipped response", async () => {
+  // 在途窗口内的样式 setter 会让响应的裁剪基准失效：提交侧必须丢弃，
+  // 否则残缺 highlights 会被重建为缓存，前缀高亮在流的剩余生命周期内永久丢失。
+  const mockClient = new MockTreeSitterClient()
+  mockClient.streamingAutoResolve = false
+
+  const styleA = SyntaxStyle.fromStyles({
+    default: { fg: RGBA.fromValues(1, 1, 1, 1) },
+    "markup.heading.1": { fg: RGBA.fromValues(0, 0, 1, 1) },
+  })
+  const styleB = SyntaxStyle.fromStyles({
+    default: { fg: RGBA.fromValues(1, 1, 1, 1) },
+    "markup.heading.1": { fg: RGBA.fromValues(1, 0, 0, 1) },
+  })
+
+  const first = "# H\n\npara text\n\n- open\n"
+  const tailStart = first.indexOf("- open\n")
+  // cacheEnd 为 0 的响应携带全量 highlights；cacheEnd 非 0 的响应模拟 worker 的真实裁剪。
+  mockClient.setStreamingResultHandler((content, cacheEnd) =>
+    cacheEnd === 0
+      ? { version: 1, changedStart: 0, tailStart, highlights: [[0, 4, "markup.heading.1"]] }
+      : { version: 1, changedStart: first.length, tailStart, highlights: [] },
+  )
+
+  const codeRenderable = new CodeRenderable(currentRenderer, {
+    id: "streaming-md-stale-clip",
+    content: first,
+    filetype: "markdown",
+    syntaxStyle: styleA,
+    treeSitterClient: mockClient,
+    streaming: true,
+    drawUnstyledText: false,
+    conceal: false,
+    left: 0,
+    top: 0,
+  })
+
+  currentRenderer.root.add(codeRenderable)
+  await renderOnce()
+  mockClient.resolveStreamingUpdate(0)
+  await waitForHighlight(codeRenderable)
+  await renderOnce()
+
+  codeRenderable.content = first + "more\n"
+  await renderOnce()
+  // 更新在途（请求携带 cacheEnd=tailStart）时切换样式：缓存失效，但旧响应仍在路上。
+  codeRenderable.syntaxStyle = styleB
+  mockClient.resolveStreamingUpdate(0)
+  await flushAsync()
+
+  // 裁剪响应必须被丢弃；dirty 标志驱动的下一帧以 cacheEnd=0 重取全量。
+  await renderOnce()
+  mockClient.resolveAllStreamingUpdates()
+  await waitForHighlight(codeRenderable)
+  await renderOnce()
+
+  // 前缀 heading 最终必须以前景色样式 B 着色；若提交了裁剪响应，这里会是无样式的默认色。
+  const frame = captureSpans()
+  const headingSpan = frame.lines.flatMap((line) => line.spans).find((span) => span.text.includes("# H"))
+  expect(headingSpan).toBeDefined()
+  expect(headingSpan!.fg.equals(RGBA.fromValues(1, 0, 0, 1))).toBe(true)
+})
+
+test("CodeRenderable streaming markdown - managed rejection commits current plain text without success callbacks", async () => {
+  // 锁定唯一的错误合同：当前原文 plain text 可见、成功回调零调用、highlightingDone 正常完成。
+  const mockClient = new MockTreeSitterClient()
+  mockClient.streamingAutoResolve = false
+
+  // 计数器是“失败帧未进入成功路径”的直接证据；任何一次调用都意味着错误被伪装成成功。
+  let onHighlightCalls = 0
+  let onChunksCalls = 0
+
+  const codeRenderable = new CodeRenderable(currentRenderer, {
+    id: "streaming-md-error",
+    content: "# broken\n",
+    filetype: "markdown",
+    syntaxStyle: streamingSyntaxStyle(),
+    treeSitterClient: mockClient,
+    streaming: true,
+    drawUnstyledText: false,
+    left: 0,
+    top: 0,
+    // 计数回调用于证明失败快照完全绕过了成功路径，而不是“部分成功”。
+    onHighlight: (highlights) => {
+      onHighlightCalls++
+      return highlights
+    },
+    onChunks: (chunks) => {
+      onChunksCalls++
+      return chunks
+    },
+  })
+
+  currentRenderer.root.add(codeRenderable)
+  await renderOnce()
+  // 确认更新已在途再拒绝，避免测试测的是“从未发起”而不是“失败处理”。
+  expect(mockClient.pendingStreamingUpdates()).toBe(1)
+
+  // rejection 模拟 worker 侧 parse/协议失败，是 managed path 唯一的错误入口。
+  mockClient.rejectStreamingUpdate(0)
+  await waitForHighlight(codeRenderable)
+  await renderOnce()
+
+  // 失败快照的唯一兼容行为：显示当前原文 plain text，且不触发该快照的成功回调。
+  expect(codeRenderable.plainText).toBe("# broken\n")
+  expect(onHighlightCalls).toBe(0)
+  expect(onChunksCalls).toBe(0)
+})
+
+test("CodeRenderable streaming markdown - onChunks receives the complete current chunk stream for every delta", async () => {
+  // INV-05 回调合同：prefix cache 只能作用于转换，绝不能让回调看到局部输入。
+  // Reasoning 的真实消费方式就是把 chunk 文本拼回全文；任何局部 tail 输入都会破坏该聚合。
+  const client = await createRealMarkdownClient()
+  try {
+    const observed: string[] = []
+    const codeRenderable = new CodeRenderable(currentRenderer, {
+      id: "streaming-md-onchunks",
+      content: "",
+      filetype: "markdown",
+      syntaxStyle: streamingSyntaxStyle(),
+      treeSitterClient: client,
+      streaming: true,
+      drawUnstyledText: false,
+      // 该测试断言 chunk 文本等于原文；conceal 会按合同移除标记符，这里显式关闭以隔离关注点。
+      conceal: false,
+      left: 0,
+      top: 0,
+      // 与 Reasoning 完全相同的 identity 形态：拿到什么就返回什么，同时记录输入。
+      onChunks: (chunks) => {
+        observed.push(chunks.map((chunk) => chunk.text).join(""))
+        return chunks
+      },
+    })
+    // 从空内容开始流式驱动：首帧创建 buffer 的路径也必须符合回调合同。
+
+    currentRenderer.root.add(codeRenderable)
+    // 表格跨越三个 delta 逐步成形，覆盖流式表格这个最不稳定的结构。
+    const deltas = ["# T\n\npara ", "graph\n\n| a |\n", "| - |\n"]
+    let content = ""
+    for (const delta of deltas) {
+      content += delta
+      codeRenderable.content = content
+      // 逐帧等待 highlight 完成，模拟真实 consumer 的可见节奏；未完成的帧不得参与断言。
+      await renderOnce()
+      await waitForHighlight(codeRenderable)
+      await renderOnce()
+    }
+
+    // Reasoning 的 identity onChunks 合同：每次都拿到完整当前内容，而不是局部 tail。
+    expect(observed.length).toBe(deltas.length)
+    let expected = ""
+    for (let i = 0; i < deltas.length; i++) {
+      expected += deltas[i]
+      // 逐帧前缀比对：任何一帧少了前缀都说明 prefix cache 污染了回调输入。
+      expect(observed[i]).toBe(expected)
+    }
+    expect(codeRenderable.plainText).toBe(content)
+  } finally {
+    await client.destroy()
+  }
+})
+
+test("CodeRenderable streaming markdown - final frame matches full render for table list fence and unicode", async () => {
+  // 组合最不稳定的结构（表格/列表/未闭合 fence）与 code-unit 边界输入（CJK/emoji），
+  // 一次性覆盖 INV-01 与 INV-07 的差分验收。
+  const client = await createRealMarkdownClient()
+  try {
+    const deltas = [
+      "# Doc\n\nIntro **bold** text.\n\n",
+      "| k | v |\n| - | - |\n| 1 | 2 |\n\n",
+      "- one\n- two\n\n",
+      "```ts\nconst a = 1\n```",
+      "\n\nUnicode 中文与 emoji 🚀\n",
+    ]
+    const content = deltas.join("")
+
+    let streamingChunks = ""
+    const streamingCode = new CodeRenderable(currentRenderer, {
+      id: "streaming-md-diff",
+      content: "",
+      filetype: "markdown",
+      syntaxStyle: streamingSyntaxStyle(),
+      treeSitterClient: client,
+      streaming: true,
+      drawUnstyledText: false,
+      left: 0,
+      top: 0,
+      // identity onChunks 同时充当样式探针：它看到的是提交前的完整 chunk 流。
+      onChunks: (chunks) => {
+        streamingChunks = serializeChunks(chunks)
+        return chunks
+      },
+    })
+    currentRenderer.root.add(streamingCode)
+
+    // 逐 delta 驱动与真实 provider 行为一致；每个中间帧都必须完成 highlight 再推进。
+    // 帧间不重置状态，prefix cache 的正确性只能在连续流上验证。
+    let appended = ""
+    for (const delta of deltas) {
+      appended += delta
+      streamingCode.content = appended
+      await renderOnce()
+      await waitForHighlight(streamingCode)
+      await renderOnce()
+    }
+
+    let fullChunks = ""
+    // full render 实例是独立 oracle：同内容、同 client、非 streaming，一次全量解析。
+    // 它与 streaming 实例共享 worker，证明差异只来自更新算法而不是环境。
+    const fullCode = new CodeRenderable(currentRenderer, {
+      id: "full-md-diff",
+      content,
+      filetype: "markdown",
+      syntaxStyle: streamingSyntaxStyle(),
+      treeSitterClient: client,
+      left: 0,
+      top: 0,
+      onChunks: (chunks) => {
+        fullChunks = serializeChunks(chunks)
+        return chunks
+      },
+    })
+    currentRenderer.root.add(fullCode)
+    await renderOnce()
+    await waitForHighlight(fullCode)
+    await renderOnce()
+
+    expect(streamingCode.plainText).toBe(fullCode.plainText)
+    // 文本一致不够：chunk 文本、fg/bg、attributes 也必须与 full render 一致，才能发现陈旧高亮。
+    expect(streamingChunks).toBe(fullChunks)
+
+    // 两个实例都显式 destroy，覆盖 owner 释放路径并保持测试间隔离。
+    streamingCode.destroy()
+    fullCode.destroy()
+  } finally {
+    // 真实 client 持有 worker 线程；测试不销毁会让后续用例排队在陈旧工作上。
+    await client.destroy()
+  }
+})
+
+test("CodeRenderable streaming markdown - onHighlight receives complete current highlights and forces full composition", async () => {
+  // 任意 onHighlight 可能返回跨切点 range；该合同禁止用局部 highlights 调用它。
+  const client = await createRealMarkdownClient()
+  try {
+    const seenStartOffsets: number[] = []
+    const codeRenderable = new CodeRenderable(currentRenderer, {
+      id: "streaming-md-onhighlight",
+      content: "",
+      filetype: "markdown",
+      syntaxStyle: streamingSyntaxStyle(),
+      treeSitterClient: client,
+      streaming: true,
+      drawUnstyledText: false,
+      // conceal 会移除 heading 标记文本，plainText 断言需要未 conceiled 的输出。
+      conceal: false,
+      left: 0,
+      top: 0,
+      // 记录每次回调的最早 highlight 起点：全量输入的合同是 min(start) == 0。
+      onHighlight: (highlights) => {
+        if (highlights.length > 0) seenStartOffsets.push(Math.min(...highlights.map((h) => h[0])))
+        return highlights
+      },
+    })
+
+    currentRenderer.root.add(codeRenderable)
+    // 第二个 delta 是未闭合列表：若 onHighlight 只收到 tail highlights，最早 offset 会大于 0。
+    let content = ""
+    for (const delta of ["# H\n\npara\n\n", "- item\n"]) {
+      content += delta
+      codeRenderable.content = content
+      await renderOnce()
+      await waitForHighlight(codeRenderable)
+      await renderOnce()
+    }
+
+    // 任意 onHighlight 可能跨越缓存切点，因此它必须始终收到覆盖完整内容的 highlights。
+    expect(seenStartOffsets.length).toBeGreaterThan(0)
+    // 每一帧的最早起点都必须是 0：任何大于 0 的值都说明回调只拿到了 tail 局部。
+    expect(Math.min(...seenStartOffsets)).toBe(0)
+    expect(codeRenderable.plainText).toBe(content)
+  } finally {
+    await client.destroy()
+  }
+})
+
+test("CodeRenderable streaming markdown - late reference definition keeps render equivalent to full render", async () => {
+  // 引用定义晚到迫使 tail 回退到用法 block；该测试锁定回退后的最终等价性。
+  const client = await createRealMarkdownClient()
+  try {
+    const deltas = ["[ref][id]\n\n", "- item\n\n", "[id]: https://example.dev\n"]
+    const content = deltas.join("")
+
+    let streamingChunks = ""
+    const streamingCode = new CodeRenderable(currentRenderer, {
+      id: "streaming-md-ref",
+      content: "",
+      filetype: "markdown",
+      syntaxStyle: streamingSyntaxStyle(),
+      treeSitterClient: client,
+      streaming: true,
+      drawUnstyledText: false,
+      left: 0,
+      top: 0,
+      onChunks: (chunks) => {
+        streamingChunks = serializeChunks(chunks)
+        return chunks
+      },
+    })
+    currentRenderer.root.add(streamingCode)
+
+    // 第三个 delta 才是定义本身；前两帧中引用处于未解析状态，tail 必须回退。
+    let appended = ""
+    for (const delta of deltas) {
+      appended += delta
+      streamingCode.content = appended
+      await renderOnce()
+      await waitForHighlight(streamingCode)
+      await renderOnce()
+    }
+
+    let fullChunks = ""
+    const fullCode = new CodeRenderable(currentRenderer, {
+      id: "full-md-ref",
+      content,
+      filetype: "markdown",
+      syntaxStyle: streamingSyntaxStyle(),
+      treeSitterClient: client,
+      left: 0,
+      top: 0,
+      onChunks: (chunks) => {
+        fullChunks = serializeChunks(chunks)
+        return chunks
+      },
+    })
+    currentRenderer.root.add(fullCode)
+    await renderOnce()
+    await waitForHighlight(fullCode)
+    await renderOnce()
+
+    // 引用定义晚到是流式常态：定义到达前引用 block 不可缓存，到达后最终渲染必须与 full render 一致。
+    expect(streamingCode.plainText).toBe(fullCode.plainText)
+    // 链接样式随定义到达而改变，chunk 级比较才能捕获 tail 回退错误造成的陈旧样式。
+    expect(streamingChunks).toBe(fullChunks)
+
+    // 显式 destroy 覆盖 buffer 释放路径；泄漏的 buffer 会让后续测试排队在孤儿 parser 上。
+    streamingCode.destroy()
+    fullCode.destroy()
+  } finally {
+    await client.destroy()
+  }
 })

@@ -38,6 +38,17 @@ export interface FiletypeParserOptions {
   injectionMapping?: InjectionMapping // Optional mapping for injection handling
 }
 
+export interface StreamingUpdateResult {
+  version: number
+  // 以下偏移全部使用已观察的 web-tree-sitter JavaScript UTF-16 code-unit 域，禁止按 UTF-8 byte 理解。
+  changedStart: number
+  // tailStart 是 parser 给出的唯一缓存资格边界：之前的 block 已闭合，之后的内容每帧全量重转。
+  tailStart: number
+  highlights: SimpleHighlight[]
+  // stale 表示响应期间 owner 已转移或有更新版本提交；调用方必须丢弃而不是提交或报错。
+  stale?: boolean
+}
+
 export interface BufferState {
   id: number
   version: number
@@ -67,6 +78,15 @@ export type TreeSitterWorkerRequest =
   | { type: "HANDLE_EDITS"; bufferId: number; version: number; content: string; edits: Edit[] }
   | { type: "GET_PERFORMANCE"; messageId: string }
   | { type: "RESET_BUFFER"; bufferId: number; version: number; content: string; edits: Edit[] }
+  | {
+      type: "STREAMING_UPDATE"
+      bufferId: number
+      version: number
+      content: string
+      // cacheEnd 是调用方已缓存前缀的终点，worker 只需返回该点之后变化的 highlights。
+      cacheEnd: number
+      messageId: string
+    }
   | { type: "DISPOSE_BUFFER"; bufferId: number }
   | { type: "ONESHOT_HIGHLIGHT"; content: string; filetype: string; messageId: string }
   | { type: "UPDATE_DATA_PATH"; dataPath: string; messageId: string }
@@ -92,6 +112,16 @@ export type TreeSitterWorkerResponse =
       hasParser: boolean
       highlights?: SimpleHighlight[]
       warning?: string
+      error?: string
+    }
+  | {
+      type: "STREAMING_UPDATE_RESPONSE"
+      bufferId: number
+      version: number
+      messageId: string
+      changedStart?: number
+      tailStart?: number
+      highlights?: SimpleHighlight[]
       error?: string
     }
   | { type: "UPDATE_DATA_PATH_RESPONSE"; messageId: string; error?: string }

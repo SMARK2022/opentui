@@ -33,6 +33,12 @@ type ParserState = {
   filetype: string
   content: string
   injectionMapping?: InjectionMapping
+  // streaming 引用链接状态：block 起点 -> 该 block 内出现的未解析 label 集合。
+  // 定义晚于用法到达是流式常态，只有定义到达后用法所在 block 才能进入稳定前缀。
+  referenceUsages?: Map<number, Set<string>>
+  referenceDefinitions?: Map<number, string>
+  // 首次扫描必须覆盖全文；之后按编辑点增量维护，否则初始内容里的未解析引用会被漏掉。
+  referencesInitialized?: boolean
 }
 
 interface FiletypeParser {
@@ -401,6 +407,7 @@ class ParserWorker {
 
   private async processInjections(
     parserState: ParserState,
+    fromIndex?: number,
   ): Promise<{ captures: QueryCapture[]; injectionRanges: Map<string, Array<{ start: number; end: number }>> }> {
     const injectionMatches: QueryCapture[] = []
     const injectionRanges = new Map<string, Array<{ start: number; end: number }>>()
@@ -410,7 +417,8 @@ class ParserWorker {
     }
 
     const content = parserState.content
-    const injectionCaptures = parserState.queries.injections.captures(parserState.tree.rootNode)
+    // streaming 更新只处理 tail 区域的 injection；前缀的 inline/code fence 内容未变，重解析是纯浪费。
+    const injectionCaptures = this.capturesFrom(parserState.queries.injections, parserState.tree.rootNode, fromIndex ?? 0)
     const languageGroups = new Map<string, Array<{ node: any; name: string }>>()
 
     // Use the injection mapping stored in the parser state
@@ -773,6 +781,275 @@ class ParserWorker {
     return highlights
   }
 
+  // 与 one-shot 相同的 markdown 兼容规则：闭合 ``` 后必须存在换行才能解析出闭合节点。
+  private normalizeStreamingParseContent(filetype: string, source: string): string {
+    return filetype === "markdown" && source.endsWith("```") ? source + "\n" : source
+  }
+
+  // web-tree-sitter 的 node index 与 Edit 均使用 JavaScript UTF-16 code-unit 域，diff 直接在字符串上进行。
+  // 该结论来自对安装版本的行为探测；一旦误判为 UTF-8 byte 域，CJK/emoji 内容的 edit 会直接撕裂字符。
+  private computeCodeUnitEdit(oldContent: string, newContent: string): Edit {
+    let start = 0
+    const maxStart = Math.min(oldContent.length, newContent.length)
+    while (start < maxStart && oldContent[start] === newContent[start]) start++
+
+    // 公共后缀必须从两端同时收缩，否则重叠区间会把同一字符同时计入前缀和后缀。
+    let oldEnd = oldContent.length
+    let newEnd = newContent.length
+    while (oldEnd > start && newEnd > start && oldContent[oldEnd - 1] === newContent[newEnd - 1]) {
+      oldEnd--
+      newEnd--
+    }
+
+    // tree.edit 同时要求 point 坐标；row 按换行数推导，column 是相对行首的 code-unit 距离。
+    const positionAt = (content: string, index: number) => {
+      let row = 0
+      let lineStart = 0
+      for (let i = 0; i < index; i++) {
+        if (content[i] === "\n") {
+          row++
+          lineStart = i + 1
+        }
+      }
+      return { row, column: index - lineStart }
+    }
+
+    // 单点 diff 足够覆盖 append 与整体 rewrite：tree-sitter 只要求一个连续编辑区间。
+    return {
+      startIndex: start,
+      oldEndIndex: oldEnd,
+      newEndIndex: newEnd,
+      startPosition: positionAt(oldContent, start),
+      oldEndPosition: positionAt(oldContent, oldEnd),
+      newEndPosition: positionAt(newContent, newEnd),
+    }
+  }
+
+  // markdown grammar 的 document/section 是透明容器；稳定边界必须落在 section 内部的最后一个 render block。
+  // 选 root child 会把整个 section 钉成 tail，导致已闭合段落在每个 delta 都被全量重转。
+  private lastRenderBlockStart(rootNode: any): number {
+    let node = rootNode
+    while ((node.type === "document" || node.type === "section") && node.namedChildCount > 0) {
+      node = node.namedChild(node.namedChildCount - 1)
+    }
+    // 最后一个 render block 始终属于 tail：只有后续 sibling 出现才能证明它闭合。
+    return node === rootNode ? 0 : node.startIndex
+  }
+
+  // section 可以按标题层级嵌套，因此收集 render block 时必须递归穿透而不是只看 root children。
+  private topLevelBlocks(rootNode: any): any[] {
+    const blocks: any[] = []
+    const collect = (container: any) => {
+      for (const child of container.namedChildren) {
+        if (child.type === "section") collect(child)
+        else blocks.push(child)
+      }
+    }
+    collect(rootNode)
+    return blocks
+  }
+
+  // query 的 range 选项在本版本 web-tree-sitter 上不可靠（既有 handleEdits 注释也踩过），
+  // 但 markdown 的 highlight/injection 模式都是 block 局部的，逐 block capture 与全量等价且只花 tail 成本。
+  private capturesFrom(query: Query, rootNode: any, fromIndex: number): QueryCapture[] {
+    // fromIndex 为 0 时是首帧或缓存失效帧：必须全量 capture，结果与 one-shot 完全一致。
+    if (fromIndex <= 0) return query.captures(rootNode)
+    const matches: QueryCapture[] = []
+    for (const block of this.topLevelBlocks(rootNode)) {
+      if (block.endIndex <= fromIndex) continue
+      matches.push(...query.captures(block))
+    }
+    return matches
+  }
+
+  // 返回最早未解析引用所在的 top-level block 起点；没有未解析引用时返回 undefined。
+  // 编辑点之前的内容与 common prefix 逐字相同，那里 block 的引用状态无需重算；
+  // 只需丢弃编辑点之后的旧 key 并重扫相交 block，避免非追加编辑退化为全文 inline parse。
+  private async updateReferenceState(parserState: ParserState, editStart: number): Promise<number | undefined> {
+    const usages = (parserState.referenceUsages ??= new Map())
+    const definitions = (parserState.referenceDefinitions ??= new Map())
+
+    if (!parserState.referencesInitialized) {
+      parserState.referencesInitialized = true
+      editStart = 0
+    }
+
+    // 编辑点之后 block 的起点会因文本增删而漂移，旧 key 不再可靠；之前的内容逐字相同，key 保持有效。
+    for (const key of [...usages.keys()]) {
+      if (key >= editStart) usages.delete(key)
+    }
+    for (const key of [...definitions.keys()]) {
+      if (key >= editStart) definitions.delete(key)
+    }
+
+    const blocks = this.topLevelBlocks(parserState.tree.rootNode).filter((block) => block.endIndex > editStart)
+    if (blocks.length === 0) return this.earliestUnresolvedBlock(usages, definitions)
+
+    let inlineParser: ReusableParserState | undefined
+    for (const block of blocks) {
+      // block 被重新扫描时先清除旧记录，避免已删除的引用残留。
+      usages.delete(block.startIndex)
+      definitions.delete(block.startIndex)
+
+      const inlineNodes: any[] = []
+      const walk = (node: any) => {
+        if (node.type === "link_reference_definition") {
+          const label = node.namedChildren.find((child: any) => child.type === "link_label")
+          // CommonMark 的 label 匹配不区分大小写，统一小写存储才能正确判定“已定义”。
+          if (label) definitions.set(block.startIndex, label.text.toLowerCase())
+          return
+        }
+        // inline 节点的文本属于 markdown_inline grammar，block 树下钻没有意义，收集后交给 inline parser。
+        if (node.type === "inline") {
+          inlineNodes.push(node)
+          return
+        }
+        for (const child of node.namedChildren) walk(child)
+      }
+      walk(block)
+
+      if (inlineNodes.length === 0) continue
+      // getReusableParser 有缓存；只有首次需要 inline 解析时才付出 Language 加载成本。
+      inlineParser ??= await this.getReusableParser("markdown_inline")
+      if (!inlineParser) continue
+
+      for (const inlineNode of inlineNodes) {
+        const inlineTree = inlineParser.parser.parse(this.getNodeText(inlineNode, parserState.content))
+        if (!inlineTree) continue
+        try {
+          const collectLabels = (node: any): void => {
+            if (
+              node.type === "full_reference_link" ||
+              node.type === "collapsed_reference_link" ||
+              node.type === "shortcut_link"
+            ) {
+              // full 形式的 label 在 link_label 子节点；collapsed/shortcut 的 label 就是 link_text。
+              const labelNode =
+                node.type === "full_reference_link"
+                  ? node.namedChildren.find((child: any) => child.type === "link_label")
+                  : node.namedChildren.find((child: any) => child.type === "link_text")
+              if (labelNode) {
+                const labels = usages.get(block.startIndex) ?? new Set<string>()
+                labels.add(labelNode.text.toLowerCase())
+                usages.set(block.startIndex, labels)
+              }
+            }
+            for (const child of node.namedChildren) collectLabels(child)
+          }
+          collectLabels(inlineTree.rootNode)
+        } finally {
+          // web-tree-sitter 的 Tree 持有 WASM 堆内存，必须显式 delete，否则每个 delta 都会泄漏。
+          inlineTree.delete()
+        }
+      }
+    }
+
+    return this.earliestUnresolvedBlock(usages, definitions)
+  }
+
+  private earliestUnresolvedBlock(
+    usages: Map<number, Set<string>>,
+    definitions: Map<number, string>,
+  ): number | undefined {
+    const definedLabels = new Set([...definitions.values()])
+    let earliest: number | undefined
+    for (const [blockStart, labels] of usages) {
+      for (const label of labels) {
+        if (definedLabels.has(label)) continue
+        // 同一 block 只要还有一个 label 未定义，它的链接渲染就可能随后续定义改变，不可进入稳定前缀。
+        earliest = earliest === undefined ? blockStart : Math.min(earliest, blockStart)
+        break
+      }
+    }
+    return earliest
+  }
+
+  // streaming 主路径的唯一 worker 入口：persistent tree 增量解析 + parser-owned tail 边界 + 裁剪 highlights。
+  // 它不复用 handleEdits 的 changed-range 事件流，因为调用方需要的是可等待的版本化结果而不是事件。
+  async handleStreamingUpdate(
+    bufferId: number,
+    version: number,
+    source: string,
+    cacheEnd: number,
+    messageId: string,
+  ): Promise<void> {
+    const parserState = this.bufferParsers.get(bufferId)
+    if (!parserState) {
+      // 错误随响应返回而不是静默成功：client 会把它转成 rejection，走 Code 的 plain-text 兼容路径。
+      postWorkerMessage({
+        type: "STREAMING_UPDATE_RESPONSE",
+        bufferId,
+        version,
+        messageId,
+        error: "No parser state found for buffer",
+      } satisfies TreeSitterWorkerResponse)
+      return
+    }
+
+    // parserState.content 保存的是上一次 normalize 后的 parse 文本，diff 必须在同一个 normalize 域里计算。
+    const parseContent = this.normalizeStreamingParseContent(parserState.filetype, source)
+    const oldContent = parserState.content
+    const edit = this.computeCodeUnitEdit(oldContent, parseContent)
+
+    // 增量 parse 复用旧 tree：tree-sitter 只重分析 edit 影响的子树，这是 persistent path 的核心收益。
+    parserState.tree.edit(edit)
+    const newTree = parserState.parser.parse(parseContent, parserState.tree)
+    if (!newTree) {
+      // parse 失败不销毁既有 tree：下一次 update 仍可从旧状态增量恢复。
+      postWorkerMessage({
+        type: "STREAMING_UPDATE_RESPONSE",
+        bufferId,
+        version,
+        messageId,
+        error: "Failed to parse buffer",
+      } satisfies TreeSitterWorkerResponse)
+      return
+    }
+
+    const changedRanges = parserState.tree.getChangedRanges(newTree)
+    parserState.tree = newTree
+    parserState.content = parseContent
+
+    // changedRanges 为空不代表无变化（tree-sitter 的已知怪癖），退化为 edit 起点保证失效证据不丢失。
+    const changedStart =
+      changedRanges.length > 0 ? Math.min(...changedRanges.map((range) => range.startIndex)) : edit.startIndex
+
+    // tailStart 是唯一的缓存资格来源；changedStart 只是失效证据，不能反过来证明某段可缓存。
+    let tailStart = this.lastRenderBlockStart(newTree.rootNode)
+    const earliestUnresolved = await this.updateReferenceState(parserState, edit.startIndex)
+    if (earliestUnresolved !== undefined) {
+      // 引用定义可以晚于用法到达，未解析用法所在的最早 block 必须回退进 tail。
+      tailStart = Math.min(tailStart, earliestUnresolved)
+    }
+
+    // Code 侧已缓存 cacheEnd 之前的内容；worker 只返回 min(changedStart, tailStart, cacheEnd) 之后的 highlights。
+    const clipStart = Math.min(changedStart, tailStart, cacheEnd)
+    const matches = this.capturesFrom(parserState.queries.highlights, newTree.rootNode, clipStart)
+
+    let injectionRanges = new Map<string, Array<{ start: number; end: number }>>()
+    if (parserState.queries.injections) {
+      // inline/code fence 的 injected parse 只覆盖 tail；前缀 injection 内容未变，重算是纯浪费。
+      const injectionResult = await this.processInjections(parserState, clipStart)
+      matches.push(...injectionResult.captures)
+      injectionRanges = injectionResult.injectionRanges
+    }
+
+    // highlights 与 one-shot 保持完全相同的 parse 域输出（含 zero-length injection 捕获），
+    // 转换层本就容忍 synthetic newline 造成的 +1 末端偏移，裁剪反而会破坏与既有路径的逐位一致。
+    const highlights = this.getSimpleHighlights(matches, injectionRanges)
+
+    postWorkerMessage({
+      type: "STREAMING_UPDATE_RESPONSE",
+      bufferId,
+      version,
+      messageId,
+      // changedStart/tailStart 属于 source 域合同；synthetic newline 只是 parse 补偿，不得泄漏给调用方。
+      changedStart: Math.min(changedStart, source.length),
+      tailStart,
+      highlights,
+    } satisfies TreeSitterWorkerResponse)
+  }
+
   async handleResetBuffer(
     bufferId: number,
     version: number,
@@ -1047,6 +1324,16 @@ if (isWorkerRuntime) {
 
         case "ONESHOT_HIGHLIGHT":
           await worker.handleOneShotHighlight(message.content, message.filetype, message.messageId)
+          break
+
+        case "STREAMING_UPDATE":
+          await worker.handleStreamingUpdate(
+            message.bufferId,
+            message.version,
+            message.content,
+            message.cacheEnd,
+            message.messageId,
+          )
           break
 
         case "UPDATE_DATA_PATH":

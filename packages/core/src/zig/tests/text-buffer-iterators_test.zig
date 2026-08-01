@@ -182,49 +182,6 @@ test "walkLines - exclude newlines in offset" {
     try testing.expectEqual(@as(u32, 10), ctx.lines.items[1].col_offset);
 }
 
-test "walkLinesInCharRange - matches full walk for bounded ranges" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var rope = try UnifiedRope.init(allocator);
-    try rope.append(.{ .linestart = {} });
-    try rope.append(.{ .text = TextChunk{ .mem_id = 0, .byte_start = 0, .byte_end = 10, .width = 10, .flags = 0 } });
-    try rope.append(.{ .brk = {} });
-    try rope.append(.{ .linestart = {} });
-    try rope.append(.{ .text = TextChunk{ .mem_id = 0, .byte_start = 10, .byte_end = 15, .width = 5, .flags = 0 } });
-    try rope.append(.{ .brk = {} });
-    try rope.append(.{ .linestart = {} });
-
-    const Context = struct {
-        lines: std.ArrayListUnmanaged(LineInfo),
-        allocator: std.mem.Allocator,
-
-        fn callback(ctx_ptr: *anyopaque, line_info: LineInfo) void {
-            const ctx = @as(*@This(), @ptrCast(@alignCast(ctx_ptr)));
-            ctx.lines.append(ctx.allocator, line_info) catch {};
-        }
-    };
-
-    var full: Context = .{ .lines = .{}, .allocator = allocator };
-    defer full.lines.deinit(allocator);
-    iter_mod.walkLines(&rope, &full, Context.callback, false);
-
-    var bounded: Context = .{ .lines = .{}, .allocator = allocator };
-    defer bounded.lines.deinit(allocator);
-    iter_mod.walkLinesInCharRange(&rope, 5, 14, &bounded, Context.callback, false);
-
-    var expected: std.ArrayListUnmanaged(LineInfo) = .{};
-    defer expected.deinit(allocator);
-    for (full.lines.items) |line| {
-        if (line.col_offset + line.width_cols <= 5) continue;
-        if (line.col_offset >= 14) break;
-        try expected.append(allocator, line);
-    }
-
-    try testing.expectEqualSlices(LineInfo, expected.items, bounded.lines.items);
-}
-
 test "coordsToOffset - valid coordinates" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

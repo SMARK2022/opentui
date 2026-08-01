@@ -24,8 +24,7 @@ export async function createTextareaRenderable(
 //    rendering=true, setting immediateRerenderRequested. The resulting re-render
 //    is scheduled via clock.setTimeout (ManualClock), so needs a second renderOnce.
 // 2. Resolve all pending highlights (proper signal via mock)
-// 3. If completion queues a newer request, drain it in the next iteration.
-// 4. Await Code.highlightingDone only after that wave creates no newer request.
+// 3. Await Code.highlightingDone on both sides (proper signal from Code)
 // Loop exits when mock has no more pending requests (state-based, not count-based).
 export async function settleDiffHighlighting(
   diff: DiffRenderable,
@@ -36,15 +35,8 @@ export async function settleDiffHighlighting(
   for (let i = 0; i < MAX; i++) {
     await render()
     await render()
-    await Promise.resolve()
-    await Promise.resolve()
     if (!client.isHighlighting()) break
     client.resolveAllHighlightOnce()
-    await Promise.resolve()
-    await Promise.resolve()
-    // 最新请求必须先进入下一轮drain，不能在没有resolver的情况下等待其Promise。
-    if (client.isHighlighting()) continue
-
     const left: CodeRenderable | null = (diff as any).leftCodeRenderable
     const right: CodeRenderable | null = (diff as any).rightCodeRenderable
     if (left) await left.highlightingDone

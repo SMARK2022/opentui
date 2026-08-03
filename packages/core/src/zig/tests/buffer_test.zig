@@ -1975,6 +1975,65 @@ test "buffer - clipped half emoji preserves the original span" {
     try std.testing.expectEqual(original_right, buf.get(2, 0).?.char);
 }
 
+test "buffer - wide grapheme straddling scissor right edge is fully clipped" {
+    // INV-02：写入 OptimizedBuffer 的任何 cell（含宽 grapheme continuation）都必须落在
+    // 当前 scissor 内。宽字符跨 scissor 右边界时整字裁剪，与左边界“起始越界跳过整字”对称。
+    const pool = gp.initGlobalPool(std.testing.allocator);
+    defer gp.deinitGlobalPool();
+
+    var buf = try OptimizedBuffer.init(std.testing.allocator, 9, 1, .{ .pool = pool, .id = "straddle-scissor" });
+    defer buf.deinit();
+
+    const solid_bg = ansi.rgbaFromFloats(0, 0, 0, 1);
+    const fg = ansi.rgbaFromFloats(1, 1, 1, 1);
+    buf.clear(solid_bg, null);
+
+    // scissor 只允许内容区 x=0..6；x=7 为边界 cell，不在 scissor 内。
+    try buf.pushScissorRect(0, 0, 7, 1);
+    defer buf.popScissorRect();
+
+    // "abcdef一" 中 "一" 起始于 x=6（scissor 内），其 continuation 本应落在 x=7（scissor 外）。
+    try buf.drawText("abcdef一", 0, 0, fg, solid_bg, 0);
+
+    // scissor 外的 cell 不得被 continuation 覆盖，保持 clear 原值；跨边界 grapheme 被整字
+    // 裁剪，其起始 cell x=6 同样保持原值（不是半个宽字符）。
+    try std.testing.expectEqual(@as(u32, buffer_mod.DEFAULT_SPACE_CHAR), buf.get(7, 0).?.char);
+    try std.testing.expectEqual(solid_bg, buf.get(7, 0).?.bg);
+    try std.testing.expectEqual(@as(u32, buffer_mod.DEFAULT_SPACE_CHAR), buf.get(6, 0).?.char);
+}
+
+test "buffer - rejected straddling write preserves existing grapheme span" {
+    // INV-02 atomic reject：跨 scissor 右边界的宽 grapheme 写入必须在任何 mutation 之前被拒绝；
+    // 若目标处已有 grapheme span，旧 span 清理/tracker 更新不得先行执行，否则被拒绝的写入会
+    // 破坏 scissor 内已有内容（R2 审计 B-02 的真实顺序缺陷）。
+    const pool = gp.initGlobalPool(std.testing.allocator);
+    defer gp.deinitGlobalPool();
+
+    var buf = try OptimizedBuffer.init(std.testing.allocator, 9, 1, .{ .pool = pool, .id = "straddle-preserve" });
+    defer buf.deinit();
+
+    const solid_bg = ansi.rgbaFromFloats(0, 0, 0, 1);
+    const fg = ansi.rgbaFromFloats(1, 1, 1, 1);
+    buf.clear(solid_bg, null);
+
+    // scissor 只允许 x=0..6；先在 x=5,6 放置完整宽字符 "你"（span 完全在 scissor 内）。
+    try buf.pushScissorRect(0, 0, 7, 1);
+    defer buf.popScissorRect();
+    try buf.drawText("abcde你", 0, 0, fg, solid_bg, 0);
+
+    const start_char = buf.get(5, 0).?.char;
+    const cont_char = buf.get(6, 0).?.char;
+
+    // 在 x=6（"你" 的 continuation 位置）尝试写入跨 scissor 右边界的 "一"（span x=6..7）。
+    // 该写入必须被整字拒绝且不产生任何 mutation：旧 "你" 的起始/continuation 与 tracker 保持原值。
+    try buf.drawText("一", 6, 0, fg, solid_bg, 0);
+
+    try std.testing.expectEqual(start_char, buf.get(5, 0).?.char);
+    try std.testing.expectEqual(cont_char, buf.get(6, 0).?.char);
+    try std.testing.expectEqual(@as(u32, buffer_mod.DEFAULT_SPACE_CHAR), buf.get(7, 0).?.char);
+    try std.testing.expect(buf.grapheme_tracker.hasAny());
+}
+
 test "OptimizedBuffer - fillRect transparent path is a no-op without trackers" {
     const pool = gp.initGlobalPool(std.testing.allocator);
     defer gp.deinitGlobalPool();

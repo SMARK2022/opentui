@@ -474,6 +474,14 @@ pub const OptimizedBuffer = struct {
 
     fn setInternal(self: *OptimizedBuffer, comptime span_cleanup: bool, x: u32, y: u32, cell: Cell) void {
         const index = self.validateAndIndex(x, y) orelse return;
+        // 跨 scissor 右边界的宽 grapheme 必须在任何 mutation（tracker 更新、旧 span 清理、cell 写入）
+        // 之前被整字拒绝：被拒绝的写入不得改变 buffer/tracker 既有状态（atomic reject）。仅当 grapheme
+        // 本可放入当前行（x + width <= self.width）却因 scissor 截断时提前拒绝；行尾放不下的情形仍由
+        // 下方既有 EOL 分支处理，与左边界“起始越界跳过整字”对称。
+        if (gp.isGraphemeChar(cell.char)) {
+            const span_width: u32 = 1 + gp.charRightExtent(cell.char);
+            if (span_width > 1 and x + span_width <= self.width and !self.isPointInScissor(@intCast(x + span_width - 1), @intCast(y))) return;
+        }
         const prev_char = self.buffer.char[index];
         const prev_link_id = ansi.TextAttributes.getLinkId(self.buffer.attributes[index]);
         var tracker_replaced = false;

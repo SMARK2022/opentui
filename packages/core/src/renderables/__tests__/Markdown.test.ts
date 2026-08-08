@@ -1561,7 +1561,7 @@ test("streaming nested structured list updates keep previous nested text visible
   expect(framesBeforeHighlight.length).toBeGreaterThan(0)
   for (const frame of framesBeforeHighlight) {
     expect(frame).toContain("2. Second ordered item before a nested list:")
-    expect(frame).toContain("- Nested bullet with a long phrase.")
+    expect(frame).toContain("- Nested bullet with a long phrase that should wrap")
     expect(frame).toContain("- Nested bullet before fenced co")
   }
 

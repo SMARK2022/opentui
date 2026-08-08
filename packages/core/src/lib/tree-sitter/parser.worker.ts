@@ -352,6 +352,8 @@ class ParserWorker {
     parser.setLanguage(filetypeParser.language)
     const tree = parser.parse(content)
     if (!tree) {
+      // parser 没有产生 Tree 时也释放 Parser，避免初始化失败留下独立 WASM owner。
+      parser.delete()
       postWorkerMessage({
         type: "PARSER_INIT_RESPONSE",
         bufferId,
@@ -370,21 +372,28 @@ class ParserWorker {
       content,
       injectionMapping: filetypeParser.injectionMapping,
     }
-    this.bufferParsers.set(bufferId, parserState)
+    try {
+      // initial query 完成前不发布 state，失败时 client 只能收到同一 messageId 的 ERROR。
+      const highlights = await this.initialQuery(parserState)
+      this.bufferParsers.set(bufferId, parserState)
 
-    postWorkerMessage({
-      type: "PARSER_INIT_RESPONSE",
-      bufferId,
-      messageId,
-      hasParser: true,
-    })
-    const highlights = await this.initialQuery(parserState)
-    postWorkerMessage({
-      type: "HIGHLIGHT_RESPONSE",
-      bufferId,
-      version,
-      ...highlights,
-    })
+      postWorkerMessage({
+        type: "PARSER_INIT_RESPONSE",
+        bufferId,
+        messageId,
+        hasParser: true,
+      })
+      postWorkerMessage({
+        type: "HIGHLIGHT_RESPONSE",
+        bufferId,
+        version,
+        ...highlights,
+      })
+    } catch (error) {
+      tree.delete()
+      parser.delete()
+      throw error
+    }
   }
 
   private async initialQuery(parserState: ParserState) {
@@ -418,7 +427,11 @@ class ParserWorker {
 
     const content = parserState.content
     // streaming 更新只处理 tail 区域的 injection；前缀的 inline/code fence 内容未变，重解析是纯浪费。
-    const injectionCaptures = this.capturesFrom(parserState.queries.injections, parserState.tree.rootNode, fromIndex ?? 0)
+    const injectionCaptures = this.capturesFrom(
+      parserState.queries.injections,
+      parserState.tree.rootNode,
+      fromIndex ?? 0,
+    )
     const languageGroups = new Map<string, Array<{ node: any; name: string }>>()
 
     // Use the injection mapping stored in the parser state
@@ -557,104 +570,132 @@ class ParserWorker {
     content: string,
     edits: Edit[],
   ): Promise<{ highlights?: HighlightResponse[]; warning?: string; error?: string }> {
-    const parserState = this.bufferParsers.get(bufferId)
-    if (!parserState) {
+    const previousState = this.bufferParsers.get(bufferId)
+    if (!previousState) {
       return { warning: "No parser state found for buffer" }
     }
 
-    parserState.content = content
+    const candidateBase = previousState.tree.copy()
+    // candidate 先承接 edit，accepted Tree 仍由 previousState 独占直到 query 完成。
+    let candidateTree: Tree | undefined
+    let accepted = false
+    const parserState: ParserState = { ...previousState, tree: candidateBase, content }
 
-    for (const edit of edits) {
-      parserState.tree.edit(edit)
-    }
+    try {
+      // parse/query/injection 的整个窗口都在 candidate 内，任何异常都不能污染 accepted state。
 
-    const startParse = performance.now()
-
-    const newTree = parserState.parser.parse(content, parserState.tree)
-
-    const endParse = performance.now()
-    const parseTime = endParse - startParse
-    this.performance.parseTimes.push(parseTime)
-    if (this.performance.parseTimes.length > 10) {
-      this.performance.parseTimes.shift()
-    }
-    this.performance.averageParseTime =
-      this.performance.parseTimes.reduce((acc, time) => acc + time, 0) / this.performance.parseTimes.length
-
-    if (!newTree) {
-      return { error: "Failed to parse buffer" }
-    }
-
-    const changedRanges = parserState.tree.getChangedRanges(newTree)
-    parserState.tree = newTree
-
-    const startQuery = performance.now()
-    const matches: QueryCapture[] = []
-
-    if (changedRanges.length === 0) {
-      edits.forEach((edit) => {
-        const range = this.editToRange(edit)
-        changedRanges.push(range)
-      })
-    }
-
-    for (const range of changedRanges) {
-      let node = parserState.tree.rootNode.descendantForPosition(range.startPosition, range.endPosition)
-
-      if (!node) {
-        continue
+      for (const edit of edits) {
+        candidateBase.edit(edit)
       }
 
-      // If we got the root node, query with range to limit scope
-      if (node.equals(parserState.tree.rootNode)) {
-        // WHY ARE RANGES NOT WORKING!?
-        // The changed ranges are not returning anything in some cases
-        // Even this shit somehow returns many lines before the actual range,
-        // and even though expanded by 1000 bytes it does not capture much beyond the actual range.
-        // So freaking weird.
-        const rangeCaptures = parserState.queries.highlights.captures(
-          node,
-          // WTF!?
-          {
-            startIndex: range.startIndex - 100,
-            endIndex: range.endIndex + 1000,
-          },
-        )
-        matches.push(...rangeCaptures)
-        continue
+      const startParse = performance.now()
+
+      // parser 返回的新 Tree 与 copy 出的 scratch Tree 都需要在 commit 时分别结算。
+      const newTree = parserState.parser.parse(content, candidateBase)
+
+      const endParse = performance.now()
+      const parseTime = endParse - startParse
+      this.performance.parseTimes.push(parseTime)
+      if (this.performance.parseTimes.length > 10) {
+        this.performance.parseTimes.shift()
+      }
+      this.performance.averageParseTime =
+        this.performance.parseTimes.reduce((acc, time) => acc + time, 0) / this.performance.parseTimes.length
+
+      if (!newTree) {
+        return { error: "Failed to parse buffer" }
       }
 
-      while (node && !this.nodeContainsRange(node, range)) {
-        node = node.parent
+      candidateTree = newTree
+      // changed range 必须从 scratch 读取；newTree 成为 accepted owner 后 scratch 会立即释放。
+      parserState.tree = newTree
+      const changedRanges = candidateBase.getChangedRanges(newTree)
+
+      const startQuery = performance.now()
+      const matches: QueryCapture[] = []
+
+      if (changedRanges.length === 0) {
+        edits.forEach((edit) => {
+          const range = this.editToRange(edit)
+          changedRanges.push(range)
+        })
       }
 
-      if (!node) {
-        node = parserState.tree.rootNode
+      for (const range of changedRanges) {
+        let node = parserState.tree.rootNode.descendantForPosition(range.startPosition, range.endPosition)
+
+        if (!node) {
+          continue
+        }
+
+        // If we got the root node, query with range to limit scope
+        if (node.equals(parserState.tree.rootNode)) {
+          // WHY ARE RANGES NOT WORKING!?
+          // The changed ranges are not returning anything in some cases
+          // Even this shit somehow returns many lines before the actual range,
+          // and even though expanded by 1000 bytes it does not capture much beyond the actual range.
+          // So freaking weird.
+          const rangeCaptures = parserState.queries.highlights.captures(
+            node,
+            // WTF!?
+            {
+              startIndex: range.startIndex - 100,
+              endIndex: range.endIndex + 1000,
+            },
+          )
+          matches.push(...rangeCaptures)
+          continue
+        }
+
+        while (node && !this.nodeContainsRange(node, range)) {
+          node = node.parent
+        }
+
+        if (!node) {
+          node = parserState.tree.rootNode
+        }
+
+        const nodeCaptures = parserState.queries.highlights.captures(node)
+        matches.push(...nodeCaptures)
       }
 
-      const nodeCaptures = parserState.queries.highlights.captures(node)
-      matches.push(...nodeCaptures)
-    }
+      let injectionRanges = new Map<string, Array<{ start: number; end: number }>>()
+      if (parserState.queries.injections) {
+        const injectionResult = await this.processInjections(parserState)
+        // Only add injection matches that are in the changed ranges
+        // This is a simplification - ideally we'd only process injections in changed ranges
+        matches.push(...injectionResult.captures)
+        injectionRanges = injectionResult.injectionRanges
+      }
 
-    let injectionRanges = new Map<string, Array<{ start: number; end: number }>>()
-    if (parserState.queries.injections) {
-      const injectionResult = await this.processInjections(parserState)
-      // Only add injection matches that are in the changed ranges
-      // This is a simplification - ideally we'd only process injections in changed ranges
-      matches.push(...injectionResult.captures)
-      injectionRanges = injectionResult.injectionRanges
-    }
+      const endQuery = performance.now()
+      const queryTime = endQuery - startQuery
+      this.performance.queryTimes.push(queryTime)
+      if (this.performance.queryTimes.length > 10) {
+        this.performance.queryTimes.shift()
+      }
+      this.performance.averageQueryTime =
+        this.performance.queryTimes.reduce((acc, time) => acc + time, 0) / this.performance.queryTimes.length
 
-    const endQuery = performance.now()
-    const queryTime = endQuery - startQuery
-    this.performance.queryTimes.push(queryTime)
-    if (this.performance.queryTimes.length > 10) {
-      this.performance.queryTimes.shift()
+      const result = this.getHighlights(parserState, matches, injectionRanges)
+      // 先安装唯一 accepted state，再释放 previous/scratch，避免中途观察到悬空 Tree。
+      this.commitCandidate(bufferId, previousState, parserState, candidateBase)
+      accepted = true
+      return result
+    } finally {
+      if (!accepted) {
+        // 失败路径只释放本次 candidate，previous Tree 留给下一次可恢复 update。
+        candidateBase.delete()
+        candidateTree?.delete()
+      }
     }
-    this.performance.averageQueryTime =
-      this.performance.queryTimes.reduce((acc, time) => acc + time, 0) / this.performance.queryTimes.length
+  }
 
-    return this.getHighlights(parserState, matches, injectionRanges)
+  private commitCandidate(bufferId: number, previousState: ParserState, nextState: ParserState, scratch?: Tree): void {
+    // 该函数是 persistent Tree ownership 的唯一转移点，调用方不能提前删除 previous。
+    this.bufferParsers.set(bufferId, nextState)
+    previousState.tree.delete()
+    scratch?.delete()
   }
 
   private nodeContainsRange(node: any, range: any): boolean {
@@ -973,8 +1014,8 @@ class ParserWorker {
     cacheEnd: number,
     messageId: string,
   ): Promise<void> {
-    const parserState = this.bufferParsers.get(bufferId)
-    if (!parserState) {
+    const previousState = this.bufferParsers.get(bufferId)
+    if (!previousState) {
       // 错误随响应返回而不是静默成功：client 会把它转成 rejection，走 Code 的 plain-text 兼容路径。
       postWorkerMessage({
         type: "STREAMING_UPDATE_RESPONSE",
@@ -987,67 +1028,86 @@ class ParserWorker {
     }
 
     // parserState.content 保存的是上一次 normalize 后的 parse 文本，diff 必须在同一个 normalize 域里计算。
+    // streaming 与普通 edit 使用同样的 candidate ownership，保持长 Session 的释放边界一致。
+    const candidateBase = previousState.tree.copy()
+    let candidateTree: Tree | undefined
+    let accepted = false
+    const parserState: ParserState = { ...previousState, tree: candidateBase }
     const parseContent = this.normalizeStreamingParseContent(parserState.filetype, source)
-    const oldContent = parserState.content
+    const oldContent = previousState.content
     const edit = this.computeCodeUnitEdit(oldContent, parseContent)
 
-    // 增量 parse 复用旧 tree：tree-sitter 只重分析 edit 影响的子树，这是 persistent path 的核心收益。
-    parserState.tree.edit(edit)
-    const newTree = parserState.parser.parse(parseContent, parserState.tree)
-    if (!newTree) {
-      // parse 失败不销毁既有 tree：下一次 update 仍可从旧状态增量恢复。
+    // 增量 parse 复用 candidate tree；accepted state 只有在 query 成功后才转移 owner。
+    try {
+      // streaming query 成功前不触碰 accepted Tree 的内容和指针。
+      candidateBase.edit(edit)
+      const newTree = parserState.parser.parse(parseContent, candidateBase)
+      if (!newTree) {
+        // parse 失败不销毁既有 tree：下一次 update 仍可从旧状态增量恢复。
+        postWorkerMessage({
+          type: "STREAMING_UPDATE_RESPONSE",
+          bufferId,
+          version,
+          messageId,
+          error: "Failed to parse buffer",
+        } satisfies TreeSitterWorkerResponse)
+        return
+      }
+
+      candidateTree = newTree
+      // changed range 在 scratch 上计算，随后由 commitCandidate 一次性转移两个 Tree。
+      parserState.tree = newTree
+      parserState.content = parseContent
+      const changedRanges = candidateBase.getChangedRanges(newTree)
+
+      // changedRanges 为空不代表无变化（tree-sitter 的已知怪癖），退化为 edit 起点保证失效证据不丢失。
+      const changedStart =
+        changedRanges.length > 0 ? Math.min(...changedRanges.map((range) => range.startIndex)) : edit.startIndex
+
+      // tailStart 是唯一的缓存资格来源；changedStart 只是失效证据，不能反过来证明某段可缓存。
+      let tailStart = this.lastRenderBlockStart(newTree.rootNode)
+      const earliestUnresolved = await this.updateReferenceState(parserState, edit.startIndex)
+      if (earliestUnresolved !== undefined) {
+        // 引用定义可以晚于用法到达，未解析用法所在的最早 block 必须回退进 tail。
+        tailStart = Math.min(tailStart, earliestUnresolved)
+      }
+
+      // Code 侧已缓存 cacheEnd 之前的内容；worker 只返回 min(changedStart, tailStart, cacheEnd) 之后的 highlights。
+      const clipStart = Math.min(changedStart, tailStart, cacheEnd)
+      const matches = this.capturesFrom(parserState.queries.highlights, newTree.rootNode, clipStart)
+
+      let injectionRanges = new Map<string, Array<{ start: number; end: number }>>()
+      if (parserState.queries.injections) {
+        // inline/code fence 的 injected parse 只覆盖 tail；前缀 injection 内容未变，重算是纯浪费。
+        const injectionResult = await this.processInjections(parserState, clipStart)
+        matches.push(...injectionResult.captures)
+        injectionRanges = injectionResult.injectionRanges
+      }
+
+      // highlights 与 one-shot 保持完全相同的 parse 域输出（含 zero-length injection 捕获），
+      // 转换层本就容忍 synthetic newline 造成的 +1 末端偏移，裁剪反而会破坏与既有路径的逐位一致。
+      const highlights = this.getSimpleHighlights(matches, injectionRanges)
+
+      this.commitCandidate(bufferId, previousState, parserState, candidateBase)
+      // response 发送前完成 ownership commit，避免 client 收到成功却仍持有旧 Tree。
+      accepted = true
       postWorkerMessage({
         type: "STREAMING_UPDATE_RESPONSE",
         bufferId,
         version,
         messageId,
-        error: "Failed to parse buffer",
+        // changedStart/tailStart 属于 source 域合同；synthetic newline 只是 parse 补偿，不得泄漏给调用方。
+        changedStart: Math.min(changedStart, source.length),
+        tailStart,
+        highlights,
       } satisfies TreeSitterWorkerResponse)
-      return
+    } finally {
+      if (!accepted) {
+        // parse/query/injection 失败时 previousState 仍然有效，只清理 candidate allocations。
+        candidateBase.delete()
+        candidateTree?.delete()
+      }
     }
-
-    const changedRanges = parserState.tree.getChangedRanges(newTree)
-    parserState.tree = newTree
-    parserState.content = parseContent
-
-    // changedRanges 为空不代表无变化（tree-sitter 的已知怪癖），退化为 edit 起点保证失效证据不丢失。
-    const changedStart =
-      changedRanges.length > 0 ? Math.min(...changedRanges.map((range) => range.startIndex)) : edit.startIndex
-
-    // tailStart 是唯一的缓存资格来源；changedStart 只是失效证据，不能反过来证明某段可缓存。
-    let tailStart = this.lastRenderBlockStart(newTree.rootNode)
-    const earliestUnresolved = await this.updateReferenceState(parserState, edit.startIndex)
-    if (earliestUnresolved !== undefined) {
-      // 引用定义可以晚于用法到达，未解析用法所在的最早 block 必须回退进 tail。
-      tailStart = Math.min(tailStart, earliestUnresolved)
-    }
-
-    // Code 侧已缓存 cacheEnd 之前的内容；worker 只返回 min(changedStart, tailStart, cacheEnd) 之后的 highlights。
-    const clipStart = Math.min(changedStart, tailStart, cacheEnd)
-    const matches = this.capturesFrom(parserState.queries.highlights, newTree.rootNode, clipStart)
-
-    let injectionRanges = new Map<string, Array<{ start: number; end: number }>>()
-    if (parserState.queries.injections) {
-      // inline/code fence 的 injected parse 只覆盖 tail；前缀 injection 内容未变，重算是纯浪费。
-      const injectionResult = await this.processInjections(parserState, clipStart)
-      matches.push(...injectionResult.captures)
-      injectionRanges = injectionResult.injectionRanges
-    }
-
-    // highlights 与 one-shot 保持完全相同的 parse 域输出（含 zero-length injection 捕获），
-    // 转换层本就容忍 synthetic newline 造成的 +1 末端偏移，裁剪反而会破坏与既有路径的逐位一致。
-    const highlights = this.getSimpleHighlights(matches, injectionRanges)
-
-    postWorkerMessage({
-      type: "STREAMING_UPDATE_RESPONSE",
-      bufferId,
-      version,
-      messageId,
-      // changedStart/tailStart 属于 source 域合同；synthetic newline 只是 parse 补偿，不得泄漏给调用方。
-      changedStart: Math.min(changedStart, source.length),
-      tailStart,
-      highlights,
-    } satisfies TreeSitterWorkerResponse)
   }
 
   async handleResetBuffer(
@@ -1055,30 +1115,39 @@ class ParserWorker {
     version: number,
     content: string,
   ): Promise<{ highlights?: HighlightResponse[]; warning?: string; error?: string }> {
-    const parserState = this.bufferParsers.get(bufferId)
-    if (!parserState) {
+    const previousState = this.bufferParsers.get(bufferId)
+    if (!previousState) {
       return { warning: "No parser state found for buffer" }
     }
 
-    parserState.content = content
-
-    const newTree = parserState.parser.parse(content)
+    // reset 是全量候选，不修改 previousState 直到 highlights 和 injections 全部成功。
+    const newTree = previousState.parser.parse(content)
 
     if (!newTree) {
       return { error: "Failed to parse buffer during reset" }
     }
 
-    parserState.tree = newTree
-    const matches = parserState.queries.highlights.captures(parserState.tree.rootNode)
+    let accepted = false
+    const parserState: ParserState = { ...previousState, tree: newTree, content }
+    try {
+      const matches = parserState.queries.highlights.captures(newTree.rootNode)
 
-    let injectionRanges = new Map<string, Array<{ start: number; end: number }>>()
-    if (parserState.queries.injections) {
-      const injectionResult = await this.processInjections(parserState)
-      matches.push(...injectionResult.captures)
-      injectionRanges = injectionResult.injectionRanges
+      let injectionRanges = new Map<string, Array<{ start: number; end: number }>>()
+      if (parserState.queries.injections) {
+        const injectionResult = await this.processInjections(parserState)
+        matches.push(...injectionResult.captures)
+        injectionRanges = injectionResult.injectionRanges
+      }
+
+      const result = this.getHighlights(parserState, matches, injectionRanges)
+      // reset 与增量路径共享同一个 accepted-state 转移点。
+      this.commitCandidate(bufferId, previousState, parserState)
+      accepted = true
+      return result
+    } finally {
+      // query 失败时新 Tree 没有进入 map，只能在这里释放。
+      if (!accepted) newTree.delete()
     }
-
-    return this.getHighlights(parserState, matches, injectionRanges)
   }
 
   disposeBuffer(bufferId: number): void {
@@ -1199,10 +1268,11 @@ function logMessage(type: TreeSitterWorkerLogType, ...args: unknown[]): void {
   } satisfies TreeSitterWorkerResponse)
 }
 
-function postWorkerError(bufferId: number | undefined, error: unknown): void {
+function postWorkerError(bufferId: number | undefined, messageId: string | undefined, error: unknown): void {
   postWorkerMessage({
     type: "ERROR",
     bufferId,
+    messageId,
     error: error instanceof Error ? error.stack || error.message : String(error),
   } satisfies TreeSitterWorkerResponse)
 }
@@ -1258,23 +1328,26 @@ if (isWorkerRuntime) {
 
         case "HANDLE_EDITS": {
           const response = await worker.handleEdits(message.bufferId, message.content, message.edits)
-          if (response.highlights && response.highlights.length > 0) {
+          if (response.highlights) {
             postWorkerMessage({
               type: "HIGHLIGHT_RESPONSE",
               bufferId: message.bufferId,
               version: message.version,
+              messageId: message.messageId,
               highlights: response.highlights,
             } satisfies TreeSitterWorkerResponse)
           } else if (response.warning) {
             postWorkerMessage({
               type: "WARNING",
               bufferId: message.bufferId,
+              messageId: message.messageId,
               warning: response.warning,
             } satisfies TreeSitterWorkerResponse)
           } else if (response.error) {
             postWorkerMessage({
               type: "ERROR",
               bufferId: message.bufferId,
+              messageId: message.messageId,
               error: response.error,
             } satisfies TreeSitterWorkerResponse)
           }
@@ -1291,23 +1364,26 @@ if (isWorkerRuntime) {
 
         case "RESET_BUFFER": {
           const resetResponse = await worker.handleResetBuffer(message.bufferId, message.version, message.content)
-          if (resetResponse.highlights && resetResponse.highlights.length > 0) {
+          if (resetResponse.highlights) {
             postWorkerMessage({
               type: "HIGHLIGHT_RESPONSE",
               bufferId: message.bufferId,
               version: message.version,
+              messageId: message.messageId,
               highlights: resetResponse.highlights,
             } satisfies TreeSitterWorkerResponse)
           } else if (resetResponse.warning) {
             postWorkerMessage({
               type: "WARNING",
               bufferId: message.bufferId,
+              messageId: message.messageId,
               warning: resetResponse.warning,
             } satisfies TreeSitterWorkerResponse)
           } else if (resetResponse.error) {
             postWorkerMessage({
               type: "ERROR",
               bufferId: message.bufferId,
+              messageId: message.messageId,
               error: resetResponse.error,
             } satisfies TreeSitterWorkerResponse)
           }
@@ -1319,6 +1395,7 @@ if (isWorkerRuntime) {
           postWorkerMessage({
             type: "BUFFER_DISPOSED",
             bufferId: message.bufferId,
+            messageId: message.messageId,
           } satisfies TreeSitterWorkerResponse)
           break
 
@@ -1376,9 +1453,9 @@ if (isWorkerRuntime) {
       }
     } catch (error) {
       if ("bufferId" in message) {
-        postWorkerError(message.bufferId, error)
+        postWorkerError(message.bufferId, "messageId" in message ? message.messageId : undefined, error)
       } else {
-        postWorkerError(undefined, error)
+        postWorkerError(undefined, "messageId" in message ? message.messageId : undefined, error)
       }
     }
   })

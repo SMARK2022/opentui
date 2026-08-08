@@ -2,6 +2,7 @@ import { type LineInfo, type RenderContext } from "../types.js"
 import { StyledText } from "../lib/styled-text.js"
 import { SyntaxStyle } from "../syntax-style.js"
 import { getTreeSitterClient, TreeSitterClient } from "../lib/tree-sitter/index.js"
+import { TreeSitterClientDestroyedError } from "../lib/tree-sitter/client.js"
 import { TextBufferRenderable, type TextBufferOptions } from "./TextBufferRenderable.js"
 import type { OptimizedBuffer } from "../buffer.js"
 import type { SimpleHighlight, StreamingUpdateResult } from "../lib/tree-sitter/types.js"
@@ -439,8 +440,11 @@ export class CodeRenderable extends TextBufferRenderable {
             this.requestRender()
             continue
           }
-          console.warn("Code streaming highlight failed, falling back to plain text:", error)
+          // destroy rejection是client生命周期的正常取消，不能与真实worker故障共用warning路径。
+          if (error instanceof TreeSitterClientDestroyedError) continue
+          // renderable先销毁但live error后到时也不应在退出阶段制造噪声。
           if (this.isDestroyed) continue
+          console.warn("Code streaming highlight failed, falling back to plain text:", error)
           // 失败帧的缓存状态不再可信：丢弃后下一帧从全量转换重建。
           this._prefixCache = undefined
           this._cachedHighlights = []
@@ -665,8 +669,10 @@ export class CodeRenderable extends TextBufferRenderable {
         return
       }
 
-      console.warn("Code highlighting failed, falling back to plain text:", error)
+      // one-shot与streaming共享typed cancellation合同，先分类正常client销毁再保留live诊断。
+      if (error instanceof TreeSitterClientDestroyedError) return
       if (this.isDestroyed) return
+      console.warn("Code highlighting failed, falling back to plain text:", error)
       this.textBuffer.setText(content)
       this.setRenderedLineSources(undefined)
       this._shouldRenderTextBuffer = true

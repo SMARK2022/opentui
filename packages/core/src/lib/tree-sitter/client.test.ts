@@ -1,5 +1,5 @@
 import { test, expect, beforeEach, afterEach, beforeAll, describe } from "bun:test"
-import { TreeSitterClient } from "./client.js"
+import { TreeSitterClient, TreeSitterClientDestroyedError } from "./client.js"
 import { tmpdir } from "os"
 import { join } from "path"
 import { existsSync } from "fs"
@@ -8,6 +8,12 @@ import { getDataPaths } from "../data-paths.js"
 import { clearEnvCache } from "../env.js"
 import { destroySingleton } from "../singleton.js"
 import { destroyTreeSitterClient, getTreeSitterClient } from "./index.js"
+import type { TreeSitterWorkerRequest, TreeSitterWorkerResponse } from "./types.js"
+import { CodeRenderable } from "../../renderables/Code.js"
+import { MarkdownRenderable } from "../../renderables/Markdown.js"
+import { SyntaxStyle } from "../../syntax-style.js"
+import { RGBA } from "../../lib/RGBA.js"
+import { createTestRenderer, MockTreeSitterClient } from "../../testing.js"
 
 describe("TreeSitterClient", () => {
   let client: TreeSitterClient
@@ -146,7 +152,7 @@ describe("TreeSitterClient", () => {
       expect(outcome.status).toBe("rejected")
       if (outcome.status === "rejected") {
         expect(outcome.error).toBeInstanceOf(Error)
-        expect((outcome.error as Error).message).toBe("Client destroyed during initialization")
+        expect(outcome.error).toBeInstanceOf(TreeSitterClientDestroyedError)
       }
       expect(client.isInitialized()).toBe(false)
     } finally {
@@ -1225,8 +1231,8 @@ describe("TreeSitterClient Edge Cases", () => {
     // Immediately destroy
     await client.destroy()
 
-    // Init promise should reject with specific error
-    await expect(initPromise).rejects.toThrow("Client destroyed during initialization")
+    // 初始化销毁与普通worker错误必须共享typed cancellation合同。
+    await expect(initPromise).rejects.toBeInstanceOf(TreeSitterClientDestroyedError)
 
     expect(client.isInitialized()).toBe(false)
   })
@@ -1371,6 +1377,227 @@ describe("TreeSitterClient Edge Cases", () => {
     await client.destroy()
   })
 
+  test("rejects a streaming request when its worker response is a correlated error", async () => {
+    // 这个seam直接模拟worker终态消息，验证public update Promise而不是私有callback表。
+    const streamingClient = new TreeSitterClient({ dataPath })
+    await streamingClient.initialize()
+    const bufferId = await streamingClient.createStreamingBuffer("", "markdown")
+    expect(bufferId).not.toBeNull()
+
+    const internals = streamingClient as unknown as {
+      worker?: {
+        onmessage: ((event: { data: TreeSitterWorkerResponse }) => void) | null
+        postMessage: (message: TreeSitterWorkerRequest) => void
+      }
+    }
+    const worker = internals.worker
+    // 真实worker仍负责初始化和parser创建，只有目标mutation响应被替换为可达ERROR。
+    expect(worker).toBeDefined()
+    if (!worker || bufferId === null) {
+      await streamingClient.destroy()
+      return
+    }
+
+    const originalPostMessage = worker.postMessage.bind(worker)
+    worker.postMessage = (message) => {
+      if (message.type !== "STREAMING_UPDATE") {
+        originalPostMessage(message)
+        return
+      }
+      // 保留messageId是本回归的独立预期值，丢失它就会重新退化为destroy前pending。
+      queueMicrotask(() => {
+        worker.onmessage?.({
+          data: {
+            type: "ERROR",
+            bufferId: message.bufferId,
+            messageId: message.messageId,
+            error: "forced streaming worker failure",
+          } as TreeSitterWorkerResponse,
+        })
+      })
+    }
+
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    // 500ms只是测试失败边界，不是生产request timeout或成功fallback。
+    const outcome = await Promise.race([
+      streamingClient.updateStreamingBuffer(bufferId, "next", 0).then(
+        () => ({ status: "fulfilled" as const }),
+        (error: unknown) => ({ status: "rejected" as const, error }),
+      ),
+      new Promise<{ status: "timeout" }>((resolve) => {
+        timeout = setTimeout(() => resolve({ status: "timeout" }), 500)
+      }),
+    ])
+    if (timeout) clearTimeout(timeout)
+
+    expect(outcome.status).toBe("rejected")
+    // rejection必须携带worker原始原因，Code才会进入既有plain-text兼容合同。
+    if (outcome.status === "rejected") {
+      expect(outcome.error).toBeInstanceOf(Error)
+      expect((outcome.error as Error).message).toContain("forced streaming worker failure")
+    }
+
+    await streamingClient.destroy()
+  })
+
+  test("silences Code cancellation warnings after destruction", async () => {
+    // 一个测试同时覆盖one-shot与streaming两条既有Code入口，避免新增第九个测试文件。
+    const testRenderer = await createTestRenderer({ width: 80, height: 24 })
+    const syntaxStyle = SyntaxStyle.fromStyles({ default: { fg: RGBA.fromValues(1, 1, 1, 1) } })
+    const warnings: unknown[][] = []
+    const originalWarn = console.warn
+    console.warn = (...args: unknown[]) => warnings.push(args)
+
+    try {
+      const oneShotClient = new MockTreeSitterClient()
+      // mock只提供可控的在途Promise，Code仍通过真实render seam触发highlight。
+      let rejectOneShot!: (error: Error) => void
+      oneShotClient.highlightOnce = () =>
+        new Promise((_, reject) => {
+          rejectOneShot = reject
+        })
+      const oneShot = new CodeRenderable(testRenderer.renderer, {
+        id: "one-shot-cancel",
+        content: "const value = 1",
+        filetype: "javascript",
+        syntaxStyle,
+        treeSitterClient: oneShotClient,
+      })
+      testRenderer.renderer.root.add(oneShot)
+      await testRenderer.renderOnce()
+      // renderOnce完成的是请求发出，不是highlight成功，随后才能制造destroy竞态。
+      // client destroy先结束在途请求；Code仍存活时也必须识别typed cancellation。
+      rejectOneShot(new TreeSitterClientDestroyedError())
+      await Promise.resolve()
+      oneShot.destroy()
+
+      const streamingClient = new MockTreeSitterClient()
+      // 禁止mock自动完成update，确保streaming catch确实看到destroy后的reject。
+      streamingClient.streamingAutoResolve = false
+      streamingClient.removeStreamingBuffer = async () => {}
+      const streaming = new CodeRenderable(testRenderer.renderer, {
+        id: "streaming-cancel",
+        content: "streaming body",
+        filetype: "markdown",
+        streaming: true,
+        syntaxStyle,
+        treeSitterClient: streamingClient,
+      })
+      testRenderer.renderer.root.add(streaming)
+      await testRenderer.renderOnce()
+      expect(streamingClient.pendingStreamingUpdates()).toBe(1)
+      // streaming rejection must observe the same destroyed guard as one-shot without changing drawUnstyledText.
+      streamingClient.rejectStreamingUpdate(0, new TreeSitterClientDestroyedError())
+      await Promise.resolve()
+      await Promise.resolve()
+      streaming.destroy()
+
+      // 两条取消路径都只能静默结束，普通live highlight warning仍由其他测试覆盖。
+      expect(warnings.filter((args) => String(args[0]).includes("highlight failed"))).toEqual([])
+    } finally {
+      console.warn = originalWarn
+      testRenderer.renderer.destroy()
+    }
+  })
+
+  test("keeps current Markdown text visible while streaming highlight is pending", async () => {
+    const testRenderer = await createTestRenderer({ width: 80, height: 24 })
+    const syntaxStyle = SyntaxStyle.fromStyles({ default: { fg: RGBA.fromValues(1, 1, 1, 1) } })
+    const markdownClient = new MockTreeSitterClient()
+    markdownClient.streamingAutoResolve = false
+    const markdown = new MarkdownRenderable(testRenderer.renderer, {
+      id: "markdown-current-token-visibility",
+      content: "- before",
+      syntaxStyle,
+      streaming: true,
+      internalBlockMode: "top-level",
+      treeSitterClient: markdownClient,
+    })
+
+    try {
+      testRenderer.renderer.root.add(markdown)
+      await testRenderer.renderOnce()
+      markdownClient.resolveAllStreamingUpdates()
+      await Promise.resolve()
+      await testRenderer.renderOnce()
+
+      markdown.content = "- current"
+      await testRenderer.renderOnce()
+      expect(markdownClient.pendingStreamingUpdates()).toBeGreaterThan(0)
+      // 断言当前token而不是旧token，锁定异步高亮窗口内的正文可见性。
+      expect(testRenderer.captureCharFrame()).toContain("- current")
+    } finally {
+      await markdownClient.destroy()
+      testRenderer.renderer.destroy()
+    }
+  })
+
+  test("keeps current Markdown blockquote text visible while highlighting is pending", async () => {
+    const testRenderer = await createTestRenderer({ width: 80, height: 24 })
+    const syntaxStyle = SyntaxStyle.fromStyles({ default: { fg: RGBA.fromValues(1, 1, 1, 1) } })
+    const markdownClient = new MockTreeSitterClient()
+    markdownClient.streamingAutoResolve = false
+    const markdown = new MarkdownRenderable(testRenderer.renderer, {
+      id: "markdown-current-blockquote-visibility",
+      content: "> before",
+      syntaxStyle,
+      streaming: true,
+      internalBlockMode: "top-level",
+      treeSitterClient: markdownClient,
+    })
+
+    try {
+      testRenderer.renderer.root.add(markdown)
+      await testRenderer.renderOnce()
+      markdownClient.resolveAllStreamingUpdates()
+      await Promise.resolve()
+      await testRenderer.renderOnce()
+
+      markdown.content = "> current"
+      await testRenderer.renderOnce()
+      expect(markdownClient.pendingStreamingUpdates()).toBeGreaterThan(0)
+      expect(testRenderer.captureCharFrame()).toContain("current")
+    } finally {
+      await markdownClient.destroy()
+      testRenderer.renderer.destroy()
+    }
+  })
+
+  test("keeps incomplete table source visible while highlighting is pending", async () => {
+    const testRenderer = await createTestRenderer({ width: 80, height: 24 })
+    const syntaxStyle = SyntaxStyle.fromStyles({ default: { fg: RGBA.fromValues(1, 1, 1, 1) } })
+    const markdownClient = new MockTreeSitterClient()
+    markdownClient.streamingAutoResolve = false
+    const markdown = new MarkdownRenderable(testRenderer.renderer, {
+      id: "markdown-incomplete-table-visibility",
+      content: "| before |\n| --- |",
+      syntaxStyle,
+      streaming: true,
+      internalBlockMode: "top-level",
+      treeSitterClient: markdownClient,
+    })
+
+    try {
+      testRenderer.renderer.root.add(markdown)
+      await testRenderer.renderOnce()
+      markdownClient.resolveAllStreamingUpdates()
+      await Promise.resolve()
+      await testRenderer.renderOnce()
+
+      const currentTableRaw = "| current |\n| --- |"
+      markdown.content = currentTableRaw
+      await testRenderer.renderOnce()
+      expect(markdownClient.pendingStreamingUpdates()).toBeGreaterThan(0)
+      // table fallback的预高亮文本必须等于传给CodeRenderable的raw，而不是空白seed。
+      const frame = testRenderer.captureCharFrame()
+      expect(frame).toContain("| current |")
+      expect(frame).toContain("| --- |")
+    } finally {
+      await markdownClient.destroy()
+      testRenderer.renderer.destroy()
+    }
+  })
+
   test("should handle data path changes with reactive getTreeSitterClient", async () => {
     const originalXdgDataHome = process.env.XDG_DATA_HOME
 
@@ -1380,10 +1607,9 @@ describe("TreeSitterClient Edge Cases", () => {
     await destroyTreeSitterClient()
 
     const dataPathsManager = getDataPaths()
-    let client: any
+    const client = getTreeSitterClient()
 
     try {
-      client = getTreeSitterClient()
       await client.initialize()
 
       const initialDataPath = dataPathsManager.globalDataPath
@@ -1446,6 +1672,7 @@ describe("TreeSitterClient Edge Cases", () => {
     })
 
     test("returns an awaitable versioned result with a parser-owned tail boundary", async () => {
+      // 该用例通过真实worker验证版本和tail合同，不能用mock结果替代persistent parser路径。
       // 该协议是 persistent path 的地基：版本化结果 + parser 给出的 tail 边界，缺一不可。
       await streamingClient.initialize()
 
@@ -1456,12 +1683,14 @@ describe("TreeSitterClient Edge Cases", () => {
       // 流式场景不再需要监听事件：调用方直接等待当前版本的解析结果。
       const appended = initial + "| a | b |\n| - | - |\n| 1 | 2 |\n"
       const result = await streamingClient.updateStreamingBuffer(id!, appended, 0)
+      // update返回才代表worker已完成Tree query，随后断言才不会把发送成功误判为渲染成功。
 
       // createBuffer 的初始 version 是 1，第一次 update 必须递增为 2；版本错位会破坏 stale 判定。
       expect(result.version).toBe(2)
       // 表格是最后一个未闭合 render block，tailStart 必须指向它的起点而不是 section 起点。
       expect(result.tailStart).toBe(initial.length)
       expect(result.highlights.length).toBeGreaterThan(0)
+      // 至少一个highlight同时证明markdown query没有退化成空成功响应。
 
       await streamingClient.removeStreamingBuffer(id!)
       // 释放后 buffer 状态必须同步消失，否则后续 update 会写入一个已失效的 parser tree。
@@ -1469,7 +1698,86 @@ describe("TreeSitterClient Edge Cases", () => {
       // 生命周期闭合是 INV-06 的协议侧证据：创建-更新-释放全链路无残留。
     })
 
+    test("waits for an in-flight update before acknowledged streaming disposal", async () => {
+      // worker消息被延迟但仍使用真实client，直接锁定mutation/dispose的先后关系。
+      await streamingClient.initialize()
+      const bufferId = await streamingClient.createStreamingBuffer("", "markdown")
+      expect(bufferId).not.toBeNull()
+      if (bufferId === null) return
+
+      const internals = streamingClient as unknown as {
+        worker?: {
+          onmessage: ((event: { data: TreeSitterWorkerResponse }) => void) | null
+          postMessage: (message: TreeSitterWorkerRequest) => void
+        }
+      }
+      const worker = internals.worker
+      // 只拦截两个目标消息，其余初始化消息继续交给真实worker完成。
+      expect(worker).toBeDefined()
+      if (!worker) return
+
+      const originalPostMessage = worker.postMessage.bind(worker)
+      let updateMessage: Extract<TreeSitterWorkerRequest, { type: "STREAMING_UPDATE" }> | undefined
+      let disposeMessage: Extract<TreeSitterWorkerRequest, { type: "DISPOSE_BUFFER" }> | undefined
+      worker.postMessage = (message) => {
+        if (message.type === "STREAMING_UPDATE") {
+          // 保存request以便测试显式驱动同一个messageId的终态。
+          updateMessage = message
+          return
+        }
+        if (message.type === "DISPOSE_BUFFER") {
+          // dispose过早到达会直接使该断言失败，而不是等待最终mirror偶然消失。
+          disposeMessage = message
+          return
+        }
+        originalPostMessage(message)
+      }
+
+      const updatePromise = streamingClient.updateStreamingBuffer(bufferId, "next", 0)
+      const removePromise = streamingClient.removeStreamingBuffer(bufferId)
+      // 两个public操作故意无间隔提交，验证Promise tail而不是调用者时序。
+      await Promise.resolve()
+
+      expect(disposeMessage).toBeUndefined()
+      expect(streamingClient.getBuffer(bufferId)).toBeDefined()
+      expect(updateMessage).toBeDefined()
+      // 在途mutation期间mirror必须仍存在，client不能先行删除它。
+      if (!updateMessage) return
+
+      worker.onmessage?.({
+        data: {
+          type: "STREAMING_UPDATE_RESPONSE",
+          bufferId,
+          version: updateMessage.version,
+          messageId: updateMessage.messageId,
+          changedStart: 0,
+          tailStart: 0,
+          highlights: [],
+        },
+      })
+      // 只有收到update response后，队列才有资格发送DISPOSE_BUFFER。
+      await updatePromise
+      await Promise.resolve()
+
+      expect(disposeMessage).toBeDefined()
+      expect(streamingClient.getBuffer(bufferId)).toBeDefined()
+      // disposal已发送但未ack时，client仍保留mirror作为未完成资源的可观察标记。
+      if (!disposeMessage) return
+
+      worker.onmessage?.({
+        data: {
+          type: "BUFFER_DISPOSED",
+          bufferId,
+          messageId: disposeMessage.messageId,
+        },
+      })
+      // worker ack是释放完成的唯一终态，不接受旧timer或本地猜测。
+      await removePromise
+      expect(streamingClient.getBuffer(bufferId)).toBeUndefined()
+    })
+
     test("applies closing-fence normalization so streamed highlights equal one-shot highlights", async () => {
+      // one-shot结果作为独立oracle，测试只比较public highlights而不复制解析算法。
       await streamingClient.initialize()
 
       // markdown parser 只有在闭合 ``` 后存在换行时才生成闭合节点，这是既有 one-shot 兼容合同。

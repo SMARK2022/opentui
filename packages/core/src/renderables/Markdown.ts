@@ -477,6 +477,11 @@ export class MarkdownRenderable extends Renderable {
       this.renderInlineContent(Lexer.lexInline(token.text), chunks)
     }
 
+    if (chunks.length === 0 && typeof token.raw === "string" && token.raw.length > 0) {
+      // 不完整表格仍走原始Markdown高亮；seed必须与CodeRenderable.content保持同一文本。
+      chunks.push(this.createDefaultChunk(token.raw))
+    }
+
     return chunks.length > 0 ? new StyledText(chunks) : undefined
   }
 
@@ -680,6 +685,8 @@ export class MarkdownRenderable extends Renderable {
         0,
         this._linkifyMarkdownChunks,
         "markup.quote",
+        // 初次异步高亮期间也必须保留blockquote正文，不能让空style清掉当前token。
+        this.createInitialStyledText(token),
       ),
     )
 
@@ -874,7 +881,14 @@ export class MarkdownRenderable extends Renderable {
     id: string,
   ): boolean {
     if ((token.type === "text" || token.type === "paragraph") && renderable instanceof CodeRenderable) {
-      this.applyMarkdownCodeRenderable(renderable, this.normalizeScrollbackMarkdownBlockRaw(token.raw), 0)
+      this.applyMarkdownCodeRenderable(
+        renderable,
+        this.normalizeScrollbackMarkdownBlockRaw(token.raw),
+        0,
+        undefined,
+        // 列表正文更新必须沿用同一token的styled seed，避免只剩编号而正文空白。
+        this.createInitialStyledText(token),
+      )
       return true
     }
 
@@ -975,6 +989,7 @@ export class MarkdownRenderable extends Renderable {
     baseHighlight?: string,
     initialStyledText?: StyledText,
   ): void {
+    // seed与content必须来自同一次token更新，否则异步高亮期间会暴露空的正文缓冲。
     renderable.initialStyledText = initialStyledText
     renderable.filetype = "markdown"
     renderable.syntaxStyle = this._syntaxStyle
@@ -996,7 +1011,13 @@ export class MarkdownRenderable extends Renderable {
 
     const child = renderable.getChildren()[0]
     if (child instanceof CodeRenderable) {
-      this.applyMarkdownCodeRenderable(child, this.getBlockquoteContent(token), 0, "markup.quote")
+      this.applyMarkdownCodeRenderable(
+        child,
+        this.getBlockquoteContent(token),
+        0,
+        "markup.quote",
+        this.createInitialStyledText(token),
+      )
       return
     }
 
@@ -1417,7 +1438,14 @@ export class MarkdownRenderable extends Renderable {
 
     if (!cache) {
       return {
-        renderable: this.createMarkdownCodeRenderable(table.raw, id, marginBottom),
+        renderable: this.createMarkdownCodeRenderable(
+          table.raw,
+          id,
+          marginBottom,
+          this._linkifyMarkdownChunks,
+          undefined,
+          this.createInitialStyledText(table),
+        ),
       }
     }
 
@@ -1695,7 +1723,13 @@ export class MarkdownRenderable extends Renderable {
 
       if (!cache) {
         if (state.renderable instanceof CodeRenderable) {
-          this.applyMarkdownCodeRenderable(state.renderable, tableToken.raw, marginBottom)
+          this.applyMarkdownCodeRenderable(
+            state.renderable,
+            tableToken.raw,
+            marginBottom,
+            undefined,
+            this.createInitialStyledText(tableToken),
+          )
           state.tableContentCache = undefined
           return
         }
@@ -1705,6 +1739,10 @@ export class MarkdownRenderable extends Renderable {
           tableToken.raw,
           `${this.id}-block-${index}`,
           marginBottom,
+          this._linkifyMarkdownChunks,
+          undefined,
+          // 不完整表格暂时退回Markdown CodeRenderable时仍使用当前raw作为可见种子。
+          this.createInitialStyledText(tableToken),
         )
         this.add(fallbackRenderable, index)
         state.renderable = fallbackRenderable
@@ -1736,6 +1774,7 @@ export class MarkdownRenderable extends Renderable {
         this.getTopLevelBlockRaw(token) ?? token.raw,
         marginBottom,
         undefined,
+        // 顶层结构化token也需要当前raw seed，正文可见性不能只由高亮结果决定。
         this.createInitialStyledText(token),
       )
       return
@@ -1881,7 +1920,15 @@ export class MarkdownRenderable extends Renderable {
     if (tokens.length === 0 && this._content.length > 0) {
       this.clearBlockStates()
       this._stableBlockCount = 0
-      const fallback = this.createMarkdownCodeRenderable(this._content, `${this.id}-fallback`)
+      const fallback = this.createMarkdownCodeRenderable(
+        this._content,
+        `${this.id}-fallback`,
+        0,
+        this._linkifyMarkdownChunks,
+        undefined,
+        // parser暂时没有结构化token时，原始正文仍是唯一可靠的当前表示。
+        this.createInitialStyledText({ type: "text", raw: this._content, text: this._content } as MarkedToken),
+      )
       this.add(fallback)
       this._blockStates = [
         {
@@ -2064,13 +2111,23 @@ export class MarkdownRenderable extends Renderable {
 
         if (!cache) {
           if (state.renderable instanceof CodeRenderable) {
-            this.applyMarkdownCodeRenderable(state.renderable, tableToken.raw, marginBottom)
+            this.applyMarkdownCodeRenderable(
+              state.renderable,
+              tableToken.raw,
+              marginBottom,
+              undefined,
+              this.createInitialStyledText(tableToken),
+            )
           } else {
             state.renderable.destroyRecursively()
             const fallbackRenderable = this.createMarkdownCodeRenderable(
               tableToken.raw,
               `${this.id}-block-${i}`,
               marginBottom,
+              this._linkifyMarkdownChunks,
+              undefined,
+              // 后续增量表格重新退回文本路径时不能丢失这次更新的raw内容。
+              this.createInitialStyledText(tableToken),
             )
             this.add(fallbackRenderable, i)
             state.renderable = fallbackRenderable
@@ -2101,6 +2158,7 @@ export class MarkdownRenderable extends Renderable {
           this.getTopLevelBlockRaw(state.token) ?? state.token.raw,
           marginBottom,
           undefined,
+          // 持久CodeRenderable复用时先提交当前表示，再等待下一次高亮结果。
           this.createInitialStyledText(state.token),
         )
         continue

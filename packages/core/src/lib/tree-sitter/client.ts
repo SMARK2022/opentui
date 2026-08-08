@@ -1,13 +1,11 @@
 import { EventEmitter } from "events"
-import { createDebounce, clearDebounceScope, DebounceController } from "../debounce.js"
-import { ProcessQueue } from "../queue.js"
 import type {
   TreeSitterClientOptions,
   TreeSitterClientEvents,
   BufferState,
-  ParsedBuffer,
   FiletypeParserOptions,
   Edit,
+  HighlightResponse,
   PerformanceStats,
   SimpleHighlight,
   StreamingUpdateResult,
@@ -37,13 +35,6 @@ declare global {
   const OTUI_TREE_SITTER_WORKER_PATH: string
 }
 
-interface EditQueueItem {
-  edits: Edit[]
-  newContent: string
-  version: number
-  isReset?: boolean
-}
-
 type TreeSitterWorkerPath = string | URL
 type TreeSitterWorkerHandle = Pick<PlatformWorkerHandle, "onerror" | "onmessage" | "postMessage" | "terminate">
 
@@ -52,8 +43,17 @@ interface TreeSitterClientInternalOptions {
 }
 
 interface PendingRequest {
-  resolve: (response: any) => void
+  resolve: (response: unknown) => void
   reject: (error: Error) => void
+}
+
+type EditResponse = { highlights?: HighlightResponse[]; error?: string }
+
+export class TreeSitterClientDestroyedError extends Error {
+  constructor() {
+    super("TreeSitter client destroyed")
+    this.name = "TreeSitterClientDestroyedError"
+  }
 }
 
 let DEFAULT_PARSER_OVERRIDES: FiletypeParserOptions[] = []
@@ -81,8 +81,8 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
     | undefined
   private messageCallbacks = new Map<string, PendingRequest>()
   private messageIdCounter: number = 0
-  private editQueues: Map<number, ProcessQueue<EditQueueItem>> = new Map()
-  private debouncer: DebounceController
+  // buffer mirror 只有在 worker 的同一请求完成后才推进，避免本地版本先于 WASM Tree 成为假状态。
+  private bufferOperations: Map<number, Promise<unknown>> = new Map()
   private options: TreeSitterClientOptions
   private destroyCallbacks = new Set<() => void>()
   private lifecycleGeneration = 0
@@ -93,7 +93,6 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
   constructor(options: TreeSitterClientOptions, internalOptions: TreeSitterClientInternalOptions = {}) {
     super()
     this.options = options
-    this.debouncer = createDebounce("tree-sitter-client")
     if (internalOptions.autoStartWorker ?? true) {
       this.startWorker()
     }
@@ -155,6 +154,33 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
     this.worker.postMessage(message)
   }
 
+  private request<T>(messageId: string, message: TreeSitterWorkerRequest): Promise<T> {
+    // callback 必须在 postMessage 前登记，否则同步 worker 响应会找不到它的终态接收者。
+    return new Promise<T>((resolve, reject) => {
+      this.messageCallbacks.set(messageId, { resolve: (response) => resolve(response as T), reject })
+      try {
+        this.sendWorkerMessage(message)
+      } catch (error) {
+        // postMessage 失败没有 worker response，必须立即移除 callback 并把异常交回调用方。
+        this.messageCallbacks.delete(messageId)
+        reject(error instanceof Error ? error : new Error(String(error)))
+      }
+    })
+  }
+
+  private enqueueBufferOperation<T>(bufferId: number, operation: () => Promise<T>, afterSettlement = false): Promise<T> {
+    // rejected mutation 仍需让 disposal 接管；afterSettlement 是释放路径唯一允许越过失败的边界。
+    const previous = this.bufferOperations.get(bufferId) ?? Promise.resolve()
+    const result = afterSettlement ? previous.then(operation, operation) : previous.then(operation)
+    this.bufferOperations.set(bufferId, result)
+    void result
+      .finally(() => {
+        if (this.bufferOperations.get(bufferId) === result) this.bufferOperations.delete(bufferId)
+      })
+      .catch(() => undefined)
+    return result
+  }
+
   private rejectPendingRequests(error: Error): void {
     const requests = Array.from(this.messageCallbacks.values())
     this.messageCallbacks.clear()
@@ -186,9 +212,9 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
     this.initializePromise = undefined
     this.rejectActiveInitialization(error)
     this.rejectPendingRequests(error)
-    this.editQueues.clear()
+    // worker 已失效时清除 operation tail，避免旧 buffer 的 rejected chain 阻塞下一次生命周期。
+    this.bufferOperations.clear()
     this.buffers.clear()
-    this.debouncer.clear()
 
     try {
       void Promise.resolve(worker.terminate()).catch(() => {})
@@ -423,6 +449,16 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
 
     switch (message.type) {
       case "HIGHLIGHT_RESPONSE": {
+        // 带 messageId 的 mutation 走 Promise 通道；无 id 的初始高亮仍保留事件兼容性。
+        if (message.messageId) {
+          const callback = this.messageCallbacks.get(message.messageId)
+          if (callback) {
+            this.messageCallbacks.delete(message.messageId)
+            callback.resolve(message)
+            return
+          }
+        }
+
         if (this.streamingBufferIds.has(message.bufferId)) {
           // streaming buffer 不使用事件通道；INITIALIZE 残留响应只是版本错位的历史噪声。
           return
@@ -434,6 +470,7 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
         }
 
         if (buffer.version !== message.version) {
+          // 初始响应落后于 mirror 时只能请求现有 reset 合同，不能提交过期 highlights。
           this.resetBuffer(message.bufferId, buffer.version, buffer.content)
           return
         }
@@ -479,9 +516,10 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
       }
 
       case "BUFFER_DISPOSED": {
-        const callback = this.messageCallbacks.get(`dispose_${message.bufferId}`)
+        // 只有 worker 回应自己的 id，client 才能确认 parser-owned Tree 已离开。
+        const callback = this.messageCallbacks.get(message.messageId)
         if (callback) {
-          this.messageCallbacks.delete(`dispose_${message.bufferId}`)
+          this.messageCallbacks.delete(message.messageId)
           callback.resolve(true)
         }
 
@@ -541,11 +579,33 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
       }
 
       case "WARNING": {
+        // 可等待 warning 不是广播事件：先拒绝对应请求，再保留一次可观察诊断。
+        if (message.messageId) {
+          const callback = this.messageCallbacks.get(message.messageId)
+          if (callback) {
+            this.messageCallbacks.delete(message.messageId)
+            const warning = new Error(message.warning)
+            warning.name = "TreeSitterWorkerWarning"
+            callback.reject(warning)
+            this.emitWarning(message.warning, message.bufferId)
+            return
+          }
+        }
         this.emitWarning(message.warning, message.bufferId)
         return
       }
 
       case "ERROR": {
+        // 相关错误必须结束原请求；单独 emit 会让 Code 一直等到 destroy 才显示正文。
+        if (message.messageId) {
+          const callback = this.messageCallbacks.get(message.messageId)
+          if (callback) {
+            this.messageCallbacks.delete(message.messageId)
+            callback.reject(new Error(message.error))
+            this.emitError(message.error, message.bufferId)
+            return
+          }
+        }
         this.emitError(message.error, message.bufferId)
         return
       }
@@ -582,31 +642,33 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
     version: number = 1,
     autoInitialize: boolean = true,
   ): Promise<boolean> {
-    if (!this.initialized) {
-      if (!autoInitialize) {
-        this.emitError("Could not create buffer because client is not initialized")
-        return false
-      }
-      try {
-        await this.initialize()
-      } catch (error) {
-        this.emitError("Could not create buffer because of initialization error")
-        return false
-      }
+    if (!this.initialized && !autoInitialize) {
+      // autoInitialize=false 是调用方明确选择的非启动路径，保持原有可诊断失败而不排队。
+      this.emitError("Could not create buffer because client is not initialized")
+      return false
     }
 
-    if (this.buffers.has(id)) {
-      throw new Error(`Buffer with id ${id} already exists`)
-    }
+    if (this.buffers.has(id)) throw new Error(`Buffer with id ${id} already exists`)
 
-    // Set buffer state immediately to avoid race conditions
-    this.buffers.set(id, { id, content, filetype, version, hasParser: false })
+    // 先占位再排队，允许紧随其后的 update/remove 共享同一个生命周期尾部。
+    const reservation: BufferState = { id, content, filetype, version, hasParser: false }
+    this.buffers.set(id, reservation)
+    let accepted = false
+    try {
+      return await this.enqueueBufferOperation(id, async () => {
+        // 初始化也属于该 buffer 的首个操作，不能在队列外发布 parser state。
+        if (!this.initialized) {
+          try {
+            await this.initialize()
+          } catch {
+            // 初始化失败时不保留 reservation，否则后续调用会误认为 buffer 仍可继续推进。
+            this.emitError("Could not create buffer because of initialization error")
+            return false
+          }
+        }
 
-    const messageId = `init_${this.messageIdCounter++}`
-    const response = await new Promise<{ hasParser: boolean; warning?: string; error?: string }>((resolve, reject) => {
-      this.messageCallbacks.set(messageId, { resolve, reject })
-      try {
-        this.sendWorkerMessage({
+        const messageId = `init_${this.messageIdCounter++}`
+        const response = await this.request<{ hasParser: boolean; warning?: string; error?: string }>(messageId, {
           type: "INITIALIZE_PARSER",
           bufferId: id,
           version,
@@ -614,52 +676,37 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
           filetype,
           messageId,
         })
-      } catch (error) {
-        this.messageCallbacks.delete(messageId)
-        reject(error instanceof Error ? error : new Error(String(error)))
-      }
-    })
 
-    if (!response.hasParser) {
-      this.emit("buffer:initialized", id, false)
-      if (filetype !== "plaintext") {
-        this.emitWarning(response.warning || response.error || "Buffer has no parser", id)
-      }
-      return false
+        if (!response.hasParser) {
+          // 无 parser 是正常的能力结果，reservation 仍保留既有非解析 buffer 合同。
+          accepted = true
+          this.emit("buffer:initialized", id, false)
+          if (filetype !== "plaintext") {
+            this.emitWarning(response.warning || response.error || "Buffer has no parser", id)
+          }
+          return false
+        }
+
+        accepted = true
+        // 只有 correlated init 成功后才把 reservation 换成可解析 mirror。
+        this.buffers.set(id, { id, content, filetype, version, hasParser: true })
+        this.emit("buffer:initialized", id, true)
+        return true
+      })
+    } finally {
+      if (!accepted && this.buffers.get(id) === reservation) this.buffers.delete(id)
     }
-
-    // Update buffer state to indicate it has a parser
-    const bufferState: ParsedBuffer = { id, content, filetype, version, hasParser: true }
-    this.buffers.set(id, bufferState)
-
-    this.emit("buffer:initialized", id, true)
-    return true
   }
 
   public async updateBuffer(id: number, edits: Edit[], newContent: string, version: number): Promise<void> {
-    if (!this.initialized) {
-      return
-    }
-
-    const buffer = this.buffers.get(id)
-    if (!buffer || !buffer.hasParser) {
-      return
-    }
-
-    // Update buffer state
-    this.buffers.set(id, { ...buffer, content: newContent, version })
-
-    if (!this.editQueues.has(id)) {
-      this.editQueues.set(
-        id,
-        new ProcessQueue<EditQueueItem>((item) =>
-          this.processEdit(id, item.edits, item.newContent, item.version, item.isReset),
-        ),
-      )
-    }
-
-    const bufferQueue = this.editQueues.get(id)!
-    bufferQueue.enqueue({ edits, newContent, version })
+    // 编辑必须等待 create 的终态，不能把未安装的 parser 当作已可写状态。
+    if (!this.buffers.has(id) && !this.bufferOperations.has(id)) return
+    await this.enqueueBufferOperation(id, async () => {
+      const buffer = this.buffers.get(id)
+      if (!this.initialized || !buffer?.hasParser) return
+      // callback response 之前不更新 mirror，后续 dispose 才能等待真实 mutation 终态。
+      await this.processEdit(id, edits, newContent, version)
+    })
   }
 
   // streaming buffer 使用负数 ID 段，避免与编辑器侧的正数 buffer ID 冲突。
@@ -683,55 +730,50 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
   }
 
   public async updateStreamingBuffer(id: number, content: string, cacheEnd: number): Promise<StreamingUpdateResult> {
-    const buffer = this.buffers.get(id)
-    if (!buffer || !buffer.hasParser) {
-      // 与 createBuffer 的既有错误表面一致：没有 parser 的 buffer 不能静默成功。
-      throw new Error("Streaming buffer has no parser")
-    }
+    // streaming 与普通编辑共用尾部，保证同一 buffer 不会并行转移两个 Tree owner。
+    return this.enqueueBufferOperation(id, async () => {
+      const buffer = this.buffers.get(id)
+      if (!buffer || !buffer.hasParser) {
+        // 没有 parser 的 streaming buffer 没有合法响应通道，直接拒绝调用方。
+        // 与 createBuffer 的既有错误表面一致：没有 parser 的 buffer 不能静默成功。
+        throw new Error("Streaming buffer has no parser")
+      }
 
-    // version 由 client 统一递增，调用方不自带序号，避免多个 producer 对同一 buffer 产生版本分叉。
-    const version = buffer.version + 1
-    this.buffers.set(id, { ...buffer, content, version })
+      // version 由 client 统一递增，调用方不自带序号，避免多个 producer 对同一 buffer 产生版本分叉。
+      const version = buffer.version + 1
+      // response 的 version 是 worker 接受的版本，不能用发送时的本地猜测替代它。
+      const messageId = `streaming_${this.messageIdCounter++}`
+      const response = await this.request<{
+        version: number
+        changedStart?: number
+        tailStart?: number
+        highlights?: SimpleHighlight[]
+        error?: string
+      }>(messageId, { type: "STREAMING_UPDATE", bufferId: id, version, content, cacheEnd, messageId })
 
-    // 与 preload/init 相同的 messageId 等待模式：每个 in-flight 请求都有唯一完成通道。
-    const messageId = `streaming_${this.messageIdCounter++}`
-    const response = await new Promise<{
-      version: number
-      changedStart?: number
-      tailStart?: number
-      highlights?: SimpleHighlight[]
-      error?: string
-    }>((resolve, reject) => {
-      this.messageCallbacks.set(messageId, { resolve, reject })
-      try {
-        this.sendWorkerMessage({ type: "STREAMING_UPDATE", bufferId: id, version, content, cacheEnd, messageId })
-      } catch (error) {
-        // 发送失败时必须摘除回调，否则 messageCallbacks 会累积永远无法完成的请求。
-        this.messageCallbacks.delete(messageId)
-        reject(error instanceof Error ? error : new Error(String(error)))
+      if (response.error) {
+        // worker error 已由 request() 相关 reject 转成异常，这个字段只覆盖协议内的显式失败响应。
+        // worker 侧失败作为 rejection 交给 Code 的既有 plain-text 兼容路径，而不是成功形态的空结果。
+        throw new Error(response.error)
+      }
+
+      const current = this.buffers.get(id)
+      if (!current || !current.hasParser) throw new Error("Streaming buffer was removed before acceptance")
+      // worker acknowledgement 到达后才提交内容和版本，失败时保留上一个可用 mirror。
+      this.buffers.set(id, { ...current, content, version: response.version })
+      return {
+        version: response.version,
+        changedStart: response.changedStart ?? 0,
+        tailStart: response.tailStart ?? 0,
+        highlights: response.highlights ?? [],
+        stale: false,
       }
     })
-
-    if (response.error) {
-      // worker 侧失败作为 rejection 交给 Code 的既有 plain-text 兼容路径，而不是成功形态的空结果。
-      throw new Error(response.error)
-    }
-
-    // 响应期间 owner 可能已转移或提交了新版本，旧版本结果不得进入 Code 的可见提交路径。
-    const current = this.buffers.get(id)
-    const stale = !current || current.version !== response.version
-    return {
-      version: response.version,
-      changedStart: response.changedStart ?? 0,
-      tailStart: response.tailStart ?? 0,
-      highlights: response.highlights ?? [],
-      stale,
-    }
   }
 
   public async removeStreamingBuffer(id: number): Promise<void> {
+    // streaming 标记必须等普通 remove 完成，避免 worker ack 前被另一条路径重新解释。
     // 与编辑器 buffer 共用同一条 DISPOSE 协议与清理逻辑，不引入第二条释放路径。
-    this.streamingBufferIds.delete(id)
     return this.removeBuffer(id)
   }
 
@@ -742,54 +784,42 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
     version: number,
     isReset = false,
   ): Promise<void> {
-    this.sendWorkerMessage({
-      type: isReset ? "RESET_BUFFER" : "HANDLE_EDITS",
-      bufferId,
-      version,
-      content: newContent,
-      edits,
-    })
+    // edit/reset 使用同一响应类型，使 worker 错误与成功高亮都完成同一个 request channel。
+    const messageId = `${isReset ? "reset" : "edit"}_${this.messageIdCounter++}`
+    const response = await this.request<EditResponse>(
+      messageId,
+      isReset
+        ? { type: "RESET_BUFFER", bufferId, version, content: newContent, edits, messageId }
+        : { type: "HANDLE_EDITS", bufferId, version, content: newContent, edits, messageId },
+    )
+    if (response.error) throw new Error(response.error)
+
+    const buffer = this.buffers.get(bufferId)
+    if (!buffer || !buffer.hasParser) throw new Error("Buffer was removed before acceptance")
+    // 本地 mirror 只在 correlated worker response 后推进，避免下一个操作读到未解析内容。
+    this.buffers.set(bufferId, { ...buffer, content: newContent, version })
+    // 事件也必须在 mirror commit 后发出，消费者看到的 version 与内容才是一致快照。
+    this.emit("highlights:response", bufferId, version, response.highlights ?? [])
   }
 
   public async removeBuffer(bufferId: number): Promise<void> {
-    if (!this.initialized) {
-      return
-    }
+    // 未初始化的无状态 remove 直接返回；已有 reservation/operation 则必须继续走释放尾部。
+    if (!this.initialized && !this.buffers.has(bufferId) && !this.bufferOperations.has(bufferId)) return
 
+    await this.enqueueBufferOperation(
+      bufferId,
+      async () => {
+        // disposal 是尾部操作；即使前一个 mutation reject，也必须实际发送释放请求。
+        if (!this.initialized || !this.worker) return
+        const messageId = `dispose_${bufferId}_${this.messageIdCounter++}`
+        await this.request(messageId, { type: "DISPOSE_BUFFER", bufferId, messageId })
+      },
+      true,
+    )
+    // 删除 mirror 的时机晚于 BUFFER_DISPOSED ack，不能用旧 timer 制造释放成功。
     this.buffers.delete(bufferId)
-
-    if (this.editQueues.has(bufferId)) {
-      this.editQueues.get(bufferId)?.clear()
-      this.editQueues.delete(bufferId)
-    }
-
-    if (this.worker) {
-      await new Promise<boolean>((resolve, reject) => {
-        const messageId = `dispose_${bufferId}`
-        this.messageCallbacks.set(messageId, { resolve, reject })
-        try {
-          this.sendWorkerMessage({
-            type: "DISPOSE_BUFFER",
-            bufferId,
-          })
-        } catch (error) {
-          console.error("Error disposing buffer", error)
-          this.messageCallbacks.delete(messageId)
-          resolve(false)
-        }
-
-        // Add a timeout in case the worker doesn't respond
-        setTimeout(() => {
-          if (this.messageCallbacks.has(messageId)) {
-            this.messageCallbacks.delete(messageId)
-            console.warn({ bufferId }, "Timed out waiting for buffer to be disposed")
-            resolve(false)
-          }
-        }, 3000)
-      })
-    }
-
-    this.debouncer.clearDebounce(`reset-${bufferId}`)
+    // ack 后移除 streaming 标记，晚到的无 id 初始高亮不会再被当成有效事件。
+    this.streamingBufferIds.delete(bufferId)
   }
 
   public destroy(): Promise<void> {
@@ -805,12 +835,12 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
     })
     this.destroyPromise = destroyPromise
 
-    const destroyError = new Error("Client destroyed during initialization")
+    const destroyError = new TreeSitterClientDestroyedError()
     this.lifecycleGeneration++
     this.initialized = false
     this.initializePromise = undefined
     this.rejectActiveInitialization(destroyError)
-    this.rejectPendingRequests(new Error("TreeSitter client destroyed"))
+    this.rejectPendingRequests(destroyError)
 
     for (const callback of this.destroyCallbacks) {
       try {
@@ -821,10 +851,8 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
     }
     this.destroyCallbacks.clear()
 
-    clearDebounceScope("tree-sitter-client")
-    this.debouncer.clear()
-
-    this.editQueues.clear()
+    // destroy 是唯一可以同时取消所有 buffer tail 的终态，避免正常 mutation 借此伪造成功。
+    this.bufferOperations.clear()
     this.buffers.clear()
 
     void this.stopWorker().then(
@@ -847,21 +875,21 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
   }
 
   public async resetBuffer(bufferId: number, version: number, content: string): Promise<void> {
-    if (!this.initialized) {
-      return
-    }
-
-    const buffer = this.buffers.get(bufferId)
-    if (!buffer || !buffer.hasParser) {
+    // reset 也要识别尚未完成的 create reservation，避免并发调用绕过生命周期序列。
+    if (!this.buffers.has(bufferId) && !this.bufferOperations.has(bufferId)) {
       this.emitError("Cannot reset buffer with no parser", bufferId)
       return
     }
-
-    // Update buffer state
-    this.buffers.set(bufferId, { ...buffer, content, version })
-
-    // Use debouncer to avoid excessive resets
-    this.debouncer.debounce(`reset-${bufferId}`, 10, () => this.processEdit(bufferId, [], content, version, true))
+    await this.enqueueBufferOperation(bufferId, async () => {
+      // reset 不再使用独立 debounce；它必须与 edit 和 dispose 共享同一顺序合同。
+      const buffer = this.buffers.get(bufferId)
+      if (!this.initialized || !buffer?.hasParser) {
+        // queued reset 可能在 create 失败后执行，此时只发出已有 error 事件而不写 mirror。
+        this.emitError("Cannot reset buffer with no parser", bufferId)
+        return
+      }
+      await this.processEdit(bufferId, [], content, version, true)
+    })
   }
 
   public getBuffer(bufferId: number): BufferState | undefined {
@@ -887,9 +915,10 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
       const messageId = `update_datapath_${this.messageIdCounter++}`
       return new Promise<void>((resolve, reject) => {
         this.messageCallbacks.set(messageId, {
-          resolve: (response: any) => {
-            if (response.error) {
-              reject(new Error(response.error))
+          resolve: (response) => {
+            const result = response as { error?: string }
+            if (result.error) {
+              reject(new Error(result.error))
             } else {
               resolve()
             }
@@ -918,9 +947,10 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
     const messageId = `clear_cache_${this.messageIdCounter++}`
     return new Promise<void>((resolve, reject) => {
       this.messageCallbacks.set(messageId, {
-        resolve: (response: any) => {
-          if (response.error) {
-            reject(new Error(response.error))
+        resolve: (response) => {
+          const result = response as { error?: string }
+          if (result.error) {
+            reject(new Error(result.error))
           } else {
             resolve()
           }

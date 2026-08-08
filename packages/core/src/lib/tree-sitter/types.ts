@@ -63,6 +63,7 @@ export interface ParsedBuffer extends BufferState {
 
 export type TreeSitterWorkerLogType = "log" | "error" | "warn"
 
+// 可等待的 mutation 必须沿同一 id 返回终态，避免 worker 异常把调用方 Promise 留到 destroy。
 export type TreeSitterWorkerRequest =
   | { type: "INIT"; dataPath: string }
   | { type: "ADD_FILETYPE_PARSER"; filetypeParser: FiletypeParserOptions }
@@ -75,9 +76,9 @@ export type TreeSitterWorkerRequest =
       filetype: string
       messageId: string
     }
-  | { type: "HANDLE_EDITS"; bufferId: number; version: number; content: string; edits: Edit[] }
+  | { type: "HANDLE_EDITS"; bufferId: number; version: number; content: string; edits: Edit[]; messageId: string }
   | { type: "GET_PERFORMANCE"; messageId: string }
-  | { type: "RESET_BUFFER"; bufferId: number; version: number; content: string; edits: Edit[] }
+  | { type: "RESET_BUFFER"; bufferId: number; version: number; content: string; edits: Edit[]; messageId: string }
   | {
       type: "STREAMING_UPDATE"
       bufferId: number
@@ -87,11 +88,13 @@ export type TreeSitterWorkerRequest =
       cacheEnd: number
       messageId: string
     }
-  | { type: "DISPOSE_BUFFER"; bufferId: number }
+  // dispose 的 messageId 让释放确认与同 buffer 的 mutation 串在同一生命周期上。
+  | { type: "DISPOSE_BUFFER"; bufferId: number; messageId: string }
   | { type: "ONESHOT_HIGHLIGHT"; content: string; filetype: string; messageId: string }
   | { type: "UPDATE_DATA_PATH"; dataPath: string; messageId: string }
   | { type: "CLEAR_CACHE"; messageId: string }
 
+// 响应类型同时承载事件和可等待请求；只有带 messageId 的分支才负责 Promise 终态。
 export type TreeSitterWorkerResponse =
   | { type: "INIT_RESPONSE"; error?: string }
   | {
@@ -102,9 +105,15 @@ export type TreeSitterWorkerResponse =
       warning?: string
       error?: string
     }
-  | { type: "HIGHLIGHT_RESPONSE"; bufferId: number; version: number; highlights: HighlightResponse[] }
+  | {
+      type: "HIGHLIGHT_RESPONSE"
+      bufferId: number
+      version: number
+      highlights: HighlightResponse[]
+      messageId?: string
+    }
   | { type: "PRELOAD_PARSER_RESPONSE"; messageId: string; hasParser: boolean }
-  | { type: "BUFFER_DISPOSED"; bufferId: number }
+  | { type: "BUFFER_DISPOSED"; bufferId: number; messageId: string }
   | { type: "PERFORMANCE_RESPONSE"; performance: PerformanceStats; messageId: string }
   | {
       type: "ONESHOT_HIGHLIGHT_RESPONSE"
@@ -126,8 +135,8 @@ export type TreeSitterWorkerResponse =
     }
   | { type: "UPDATE_DATA_PATH_RESPONSE"; messageId: string; error?: string }
   | { type: "CLEAR_CACHE_RESPONSE"; messageId: string; error?: string }
-  | { type: "WARNING"; bufferId?: number; warning: string }
-  | { type: "ERROR"; bufferId?: number; error: string }
+  | { type: "WARNING"; bufferId?: number; messageId?: string; warning: string }
+  | { type: "ERROR"; bufferId?: number; messageId?: string; error: string }
   | { type: "WORKER_LOG"; logType: TreeSitterWorkerLogType; data: unknown[] }
 
 export interface TreeSitterClientEvents {

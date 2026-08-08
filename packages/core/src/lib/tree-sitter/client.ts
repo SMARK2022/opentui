@@ -397,15 +397,7 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
 
   public async getPerformance(): Promise<PerformanceStats> {
     const messageId = `performance_${this.messageIdCounter++}`
-    return new Promise<PerformanceStats>((resolve, reject) => {
-      this.messageCallbacks.set(messageId, { resolve, reject })
-      try {
-        this.sendWorkerMessage({ type: "GET_PERFORMANCE", messageId })
-      } catch (error) {
-        this.messageCallbacks.delete(messageId)
-        reject(error instanceof Error ? error : new Error(String(error)))
-      }
-    })
+    return this.request<PerformanceStats>(messageId, { type: "GET_PERFORMANCE", messageId })
   }
 
   public async highlightOnce(
@@ -421,20 +413,7 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
     }
 
     const messageId = `oneshot_${this.messageIdCounter++}`
-    return new Promise((resolve, reject) => {
-      this.messageCallbacks.set(messageId, { resolve, reject })
-      try {
-        this.sendWorkerMessage({
-          type: "ONESHOT_HIGHLIGHT",
-          content,
-          filetype,
-          messageId,
-        })
-      } catch (error) {
-        this.messageCallbacks.delete(messageId)
-        reject(error instanceof Error ? error : new Error(String(error)))
-      }
-    })
+    return this.request(messageId, { type: "ONESHOT_HIGHLIGHT", content, filetype, messageId })
   }
 
   private handleWorkerMessage(event: WorkerMessageEvent<TreeSitterWorkerResponse>) {
@@ -612,18 +591,10 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
 
   public async preloadParser(filetype: string): Promise<boolean> {
     const messageId = `has_parser_${this.messageIdCounter++}`
-    const response = await new Promise<{ hasParser: boolean; warning?: string; error?: string }>((resolve, reject) => {
-      this.messageCallbacks.set(messageId, { resolve, reject })
-      try {
-        this.sendWorkerMessage({
-          type: "PRELOAD_PARSER",
-          filetype,
-          messageId,
-        })
-      } catch (error) {
-        this.messageCallbacks.delete(messageId)
-        reject(error instanceof Error ? error : new Error(String(error)))
-      }
+    const response = await this.request<{ hasParser: boolean; warning?: string; error?: string }>(messageId, {
+      type: "PRELOAD_PARSER",
+      filetype,
+      messageId,
     })
     return response.hasParser
   }

@@ -447,8 +447,8 @@ export class MarkdownRenderable extends Renderable {
     return {
       __isChunk: true,
       text,
-      fg: style?.fg,
-      bg: style?.bg,
+      fg: this._fg ?? style?.fg,
+      bg: this._bg ?? style?.bg,
       attributes: style
         ? createTextAttributes({
             bold: style.bold,

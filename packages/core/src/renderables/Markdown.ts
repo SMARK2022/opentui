@@ -485,6 +485,12 @@ export class MarkdownRenderable extends Renderable {
     return chunks.length > 0 ? new StyledText(chunks) : undefined
   }
 
+  private getCurrentMarkdownSeed(content: string, seed?: StyledText): StyledText | undefined {
+    if (seed) return seed
+    // persistent Code在等待高亮时仍需使用当前content；这是正常表示阶段，不是失败后的替代渲染。
+    return this.createInitialStyledText({ type: "text", raw: content, text: content } as MarkedToken)
+  }
+
   private renderInlineContent(tokens: Token[], chunks: TextChunk[]): void {
     for (const token of tokens) {
       this.renderInlineToken(token as MarkedToken, chunks)
@@ -640,6 +646,7 @@ export class MarkdownRenderable extends Renderable {
     baseHighlight?: string,
     initialStyledText?: StyledText,
   ): CodeRenderable {
+    const currentSeed = this.getCurrentMarkdownSeed(content, initialStyledText)
     return new CodeRenderable(this.ctx, {
       id,
       content,
@@ -648,9 +655,9 @@ export class MarkdownRenderable extends Renderable {
       fg: this._fg,
       bg: this._bg,
       conceal: this._conceal,
-      drawUnstyledText: initialStyledText !== undefined,
+      drawUnstyledText: currentSeed !== undefined,
       streaming: true,
-      initialStyledText,
+      initialStyledText: currentSeed,
       baseHighlight,
       onChunks,
       treeSitterClient: this._treeSitterClient,
@@ -990,13 +997,14 @@ export class MarkdownRenderable extends Renderable {
     initialStyledText?: StyledText,
   ): void {
     // seed与content必须来自同一次token更新，否则异步高亮期间会暴露空的正文缓冲。
-    renderable.initialStyledText = initialStyledText
+    const currentSeed = this.getCurrentMarkdownSeed(content, initialStyledText)
+    renderable.initialStyledText = currentSeed
     renderable.filetype = "markdown"
     renderable.syntaxStyle = this._syntaxStyle
     renderable.fg = this._fg
     renderable.bg = this._bg
     renderable.conceal = this._conceal
-    renderable.drawUnstyledText = initialStyledText !== undefined
+    renderable.drawUnstyledText = currentSeed !== undefined
     renderable.streaming = true
     renderable.baseHighlight = baseHighlight
     renderable.content = content

@@ -49,13 +49,6 @@ interface PendingRequest {
 
 type EditResponse = { highlights?: HighlightResponse[]; error?: string }
 
-export class TreeSitterClientDestroyedError extends Error {
-  constructor() {
-    super("TreeSitter client destroyed")
-    this.name = "TreeSitterClientDestroyedError"
-  }
-}
-
 let DEFAULT_PARSER_OVERRIDES: FiletypeParserOptions[] = []
 
 export function addDefaultParsers(parsers: FiletypeParserOptions[]): void {
@@ -835,7 +828,7 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
     })
     this.destroyPromise = destroyPromise
 
-    const destroyError = new TreeSitterClientDestroyedError()
+    const destroyError = new Error("TreeSitter client destroyed")
     this.lifecycleGeneration++
     this.initialized = false
     this.initializePromise = undefined

@@ -1,5 +1,5 @@
 import { test, expect, beforeEach, afterEach, beforeAll, describe } from "bun:test"
-import { TreeSitterClient, TreeSitterClientDestroyedError } from "./client.js"
+import { TreeSitterClient } from "./client.js"
 import { tmpdir } from "os"
 import { join } from "path"
 import { existsSync } from "fs"
@@ -152,7 +152,7 @@ describe("TreeSitterClient", () => {
       expect(outcome.status).toBe("rejected")
       if (outcome.status === "rejected") {
         expect(outcome.error).toBeInstanceOf(Error)
-        expect(outcome.error).toBeInstanceOf(TreeSitterClientDestroyedError)
+        expect((outcome.error as Error).message).toContain("TreeSitter client destroyed")
       }
       expect(client.isInitialized()).toBe(false)
     } finally {
@@ -1231,8 +1231,8 @@ describe("TreeSitterClient Edge Cases", () => {
     // Immediately destroy
     await client.destroy()
 
-    // 初始化销毁与普通worker错误必须共享typed cancellation合同。
-    await expect(initPromise).rejects.toBeInstanceOf(TreeSitterClientDestroyedError)
+    // 初始化销毁与普通worker错误都必须结束各自的Promise。
+    await expect(initPromise).rejects.toThrow("TreeSitter client destroyed")
 
     expect(client.isInitialized()).toBe(false)
   })
@@ -1466,10 +1466,10 @@ describe("TreeSitterClient Edge Cases", () => {
       testRenderer.renderer.root.add(oneShot)
       await testRenderer.renderOnce()
       // renderOnce完成的是请求发出，不是highlight成功，随后才能制造destroy竞态。
-      // client destroy先结束在途请求；Code仍存活时也必须识别typed cancellation。
-      rejectOneShot(new TreeSitterClientDestroyedError())
-      await Promise.resolve()
       oneShot.destroy()
+      // renderer先销毁Code，再由client完成在途请求；destroyed owner不应发出warning。
+      rejectOneShot(new Error("TreeSitter client destroyed"))
+      await Promise.resolve()
 
       const streamingClient = new MockTreeSitterClient()
       // 禁止mock自动完成update，确保streaming catch确实看到destroy后的reject。
@@ -1486,11 +1486,11 @@ describe("TreeSitterClient Edge Cases", () => {
       testRenderer.renderer.root.add(streaming)
       await testRenderer.renderOnce()
       expect(streamingClient.pendingStreamingUpdates()).toBe(1)
-      // streaming rejection must observe the same destroyed guard as one-shot without changing drawUnstyledText.
-      streamingClient.rejectStreamingUpdate(0, new TreeSitterClientDestroyedError())
-      await Promise.resolve()
-      await Promise.resolve()
+      // streaming rejection follows the same destroyed-owner ordering as one-shot.
       streaming.destroy()
+      streamingClient.rejectStreamingUpdate(0, new Error("TreeSitter client destroyed"))
+      await Promise.resolve()
+      await Promise.resolve()
 
       // 两条取消路径都只能静默结束，普通live highlight warning仍由其他测试覆盖。
       expect(warnings.filter((args) => String(args[0]).includes("highlight failed"))).toEqual([])

@@ -73,6 +73,7 @@ class ParserWorker {
   private dataPath: string | undefined
   private tsDataPath: string | undefined
   private initialized: boolean = false
+  private parserAssetTail: Promise<void> = Promise.resolve()
 
   constructor() {
     this.performance = {
@@ -81,6 +82,16 @@ class ParserWorker {
       averageQueryTime: 0,
       queryTimes: [],
     }
+  }
+
+  runWithParserAssets<T>(operation: () => Promise<T> | T): Promise<T> {
+    // 所有共享parser asset使用与失效共用一个owner；前序失败不能阻断后续cleanup。
+    const result = this.parserAssetTail.then(operation, operation)
+    this.parserAssetTail = result.then(
+      () => undefined,
+      () => undefined,
+    )
+    return result
   }
 
   private async fetchQueries(sources: string[], filetype: string): Promise<string> {
@@ -492,55 +503,53 @@ class ParserWorker {
 
       const parser = injectedParser.parser
       for (const { node: injectionNode } of captures) {
+        // Record the injection range
+        injectionRanges.get(language)!.push({
+          start: injectionNode.startIndex,
+          end: injectionNode.endIndex,
+        })
+
+        const injectionContent = this.getNodeText(injectionNode, content)
+        const tree = parser.parse(injectionContent)
+        if (!tree) throw new Error(`Failed to parse injection for language ${language}`)
+
         try {
-          // Record the injection range
-          injectionRanges.get(language)!.push({
-            start: injectionNode.startIndex,
-            end: injectionNode.endIndex,
-          })
+          const matches = injectedParser.queries.highlights.captures(tree.rootNode)
 
-          const injectionContent = this.getNodeText(injectionNode, content)
-          const tree = parser.parse(injectionContent)
-
-          if (tree) {
-            const matches = injectedParser.queries.highlights.captures(tree.rootNode)
-
-            // Create new QueryCapture objects with offset positions
-            for (const match of matches) {
-              // Calculate offset positions by creating a new capture with adjusted node properties
-              // Store the injected query reference so we can look up properties correctly
-              const offsetCapture: QueryCapture & { _injectedQuery?: Query } = {
-                name: match.name,
-                patternIndex: match.patternIndex,
-                _injectedQuery: injectedParser.queries.highlights, // Store the correct query reference
-                node: {
-                  ...match.node,
-                  startPosition: {
-                    row: match.node.startPosition.row + injectionNode.startPosition.row,
-                    column:
-                      match.node.startPosition.row === 0
-                        ? match.node.startPosition.column + injectionNode.startPosition.column
-                        : match.node.startPosition.column,
-                  },
-                  endPosition: {
-                    row: match.node.endPosition.row + injectionNode.startPosition.row,
-                    column:
-                      match.node.endPosition.row === 0
-                        ? match.node.endPosition.column + injectionNode.startPosition.column
-                        : match.node.endPosition.column,
-                  },
-                  startIndex: match.node.startIndex + injectionNode.startIndex,
-                  endIndex: match.node.endIndex + injectionNode.startIndex,
-                } as any, // Cast to any since we're creating a pseudo-node
-              }
-
-              injectionMatches.push(offsetCapture)
+          // Create new QueryCapture objects with offset positions
+          for (const match of matches) {
+            // Calculate offset positions by creating a new capture with adjusted node properties
+            // Store the injected query reference so we can look up properties correctly
+            const offsetCapture: QueryCapture & { _injectedQuery?: Query } = {
+              name: match.name,
+              patternIndex: match.patternIndex,
+              _injectedQuery: injectedParser.queries.highlights, // Store the correct query reference
+              node: {
+                ...match.node,
+                startPosition: {
+                  row: match.node.startPosition.row + injectionNode.startPosition.row,
+                  column:
+                    match.node.startPosition.row === 0
+                      ? match.node.startPosition.column + injectionNode.startPosition.column
+                      : match.node.startPosition.column,
+                },
+                endPosition: {
+                  row: match.node.endPosition.row + injectionNode.startPosition.row,
+                  column:
+                    match.node.endPosition.row === 0
+                      ? match.node.endPosition.column + injectionNode.startPosition.column
+                      : match.node.endPosition.column,
+                },
+                startIndex: match.node.startIndex + injectionNode.startIndex,
+                endIndex: match.node.endIndex + injectionNode.startIndex,
+              } as any, // Cast to any since we're creating a pseudo-node
             }
 
-            tree.delete()
+            injectionMatches.push(offsetCapture)
           }
-        } catch (error) {
-          console.error(`Error processing injection for language ${language}:`, error)
+        } finally {
+          // Query失败时Tree仍由本次injection拥有，必须释放后再把失败交回请求owner。
+          tree.delete()
         }
       }
 
@@ -956,7 +965,7 @@ class ParserWorker {
 
       for (const inlineNode of inlineNodes) {
         const inlineTree = inlineParser.parser.parse(this.getNodeText(inlineNode, parserState.content))
-        if (!inlineTree) continue
+        if (!inlineTree) throw new Error("Failed to parse markdown inline references")
         try {
           const collectLabels = (node: any): void => {
             if (
@@ -1252,6 +1261,8 @@ class ParserWorker {
 
       this.filetypeParsers.clear()
       this.filetypeParserPromises.clear()
+      // clear位于asset barrier内，所有旧Parser此时都已无人使用。
+      for (const state of this.reusableParsers.values()) state.parser.delete()
       this.reusableParsers.clear()
       this.reusableParserPromises.clear()
     } catch (error) {
@@ -1303,11 +1314,11 @@ if (isWorkerRuntime) {
           break
 
         case "ADD_FILETYPE_PARSER":
-          worker.addFiletypeParser(message.filetypeParser)
+          await worker.runWithParserAssets(() => worker.addFiletypeParser(message.filetypeParser))
           break
 
         case "PRELOAD_PARSER": {
-          const maybeParser = await worker.preloadParser(message.filetype)
+          const maybeParser = await worker.runWithParserAssets(() => worker.preloadParser(message.filetype))
           postWorkerMessage({
             type: "PRELOAD_PARSER_RESPONSE",
             messageId: message.messageId,
@@ -1317,17 +1328,21 @@ if (isWorkerRuntime) {
         }
 
         case "INITIALIZE_PARSER":
-          await worker.handleInitializeParser(
-            message.bufferId,
-            message.version,
-            message.content,
-            message.filetype,
-            message.messageId,
+          await worker.runWithParserAssets(() =>
+            worker.handleInitializeParser(
+              message.bufferId,
+              message.version,
+              message.content,
+              message.filetype,
+              message.messageId,
+            ),
           )
           break
 
         case "HANDLE_EDITS": {
-          const response = await worker.handleEdits(message.bufferId, message.content, message.edits)
+          const response = await worker.runWithParserAssets(() =>
+            worker.handleEdits(message.bufferId, message.content, message.edits),
+          )
           if (response.highlights) {
             postWorkerMessage({
               type: "HIGHLIGHT_RESPONSE",
@@ -1363,7 +1378,9 @@ if (isWorkerRuntime) {
           break
 
         case "RESET_BUFFER": {
-          const resetResponse = await worker.handleResetBuffer(message.bufferId, message.version, message.content)
+          const resetResponse = await worker.runWithParserAssets(() =>
+            worker.handleResetBuffer(message.bufferId, message.version, message.content),
+          )
           if (resetResponse.highlights) {
             postWorkerMessage({
               type: "HIGHLIGHT_RESPONSE",
@@ -1400,16 +1417,20 @@ if (isWorkerRuntime) {
           break
 
         case "ONESHOT_HIGHLIGHT":
-          await worker.handleOneShotHighlight(message.content, message.filetype, message.messageId)
+          await worker.runWithParserAssets(() =>
+            worker.handleOneShotHighlight(message.content, message.filetype, message.messageId),
+          )
           break
 
         case "STREAMING_UPDATE":
-          await worker.handleStreamingUpdate(
-            message.bufferId,
-            message.version,
-            message.content,
-            message.cacheEnd,
-            message.messageId,
+          await worker.runWithParserAssets(() =>
+            worker.handleStreamingUpdate(
+              message.bufferId,
+              message.version,
+              message.content,
+              message.cacheEnd,
+              message.messageId,
+            ),
           )
           break
 
@@ -1431,7 +1452,7 @@ if (isWorkerRuntime) {
 
         case "CLEAR_CACHE":
           try {
-            await worker.clearCache()
+            await worker.runWithParserAssets(() => worker.clearCache())
             postWorkerMessage({
               type: "CLEAR_CACHE_RESPONSE",
               messageId: message.messageId,

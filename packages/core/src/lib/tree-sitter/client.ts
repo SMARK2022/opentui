@@ -161,7 +161,11 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
     })
   }
 
-  private enqueueBufferOperation<T>(bufferId: number, operation: () => Promise<T>, afterSettlement = false): Promise<T> {
+  private enqueueBufferOperation<T>(
+    bufferId: number,
+    operation: () => Promise<T>,
+    afterSettlement = false,
+  ): Promise<T> {
     // rejected mutation 仍需让 disposal 接管；afterSettlement 是释放路径唯一允许越过失败的边界。
     const previous = this.bufferOperations.get(bufferId) ?? Promise.resolve()
     const result = afterSettlement ? previous.then(operation, operation) : previous.then(operation)
@@ -405,11 +409,7 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
     filetype: string,
   ): Promise<{ highlights?: SimpleHighlight[]; warning?: string; error?: string }> {
     if (!this.initialized) {
-      try {
-        await this.initialize()
-      } catch (error) {
-        return { error: "Could not highlight because of initialization error" }
-      }
+      await this.initialize()
     }
 
     const messageId = `oneshot_${this.messageIdCounter++}`
@@ -512,7 +512,12 @@ export class TreeSitterClient extends EventEmitter<TreeSitterClientEvents> {
         const callback = this.messageCallbacks.get(message.messageId)
         if (callback) {
           this.messageCallbacks.delete(message.messageId)
-          callback.resolve({ highlights: message.highlights, warning: message.warning, error: message.error })
+          if (message.error) {
+            // 真实error必须结束对应请求，warning-only仍是unsupported capability结果。
+            callback.reject(new Error(message.error))
+            return
+          }
+          callback.resolve({ highlights: message.highlights, warning: message.warning })
         }
         return
       }

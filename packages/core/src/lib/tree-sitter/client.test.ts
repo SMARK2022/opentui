@@ -8,6 +8,7 @@ import { getDataPaths } from "../data-paths.js"
 import { clearEnvCache } from "../env.js"
 import { destroySingleton } from "../singleton.js"
 import { destroyTreeSitterClient, getTreeSitterClient } from "./index.js"
+import { getParsers } from "./default-parsers.js"
 import type { TreeSitterWorkerRequest, TreeSitterWorkerResponse } from "./types.js"
 import { CodeRenderable } from "../../renderables/Code.js"
 import { MarkdownRenderable } from "../../renderables/Markdown.js"
@@ -1439,6 +1440,124 @@ describe("TreeSitterClient Edge Cases", () => {
 
     await streamingClient.destroy()
   })
+
+  test("rejects a one-shot request when its worker response is a correlated error", async () => {
+    const oneShotClient = new TreeSitterClient({ dataPath })
+    await oneShotClient.initialize()
+
+    const internals = oneShotClient as unknown as {
+      worker?: {
+        onmessage: ((event: { data: TreeSitterWorkerResponse }) => void) | null
+        postMessage: (message: TreeSitterWorkerRequest) => void
+      }
+    }
+    const worker = internals.worker
+    expect(worker).toBeDefined()
+    if (!worker) {
+      await oneShotClient.destroy()
+      return
+    }
+
+    const originalPostMessage = worker.postMessage.bind(worker)
+    worker.postMessage = (message) => {
+      if (message.type !== "ONESHOT_HIGHLIGHT") {
+        originalPostMessage(message)
+        return
+      }
+      queueMicrotask(() => {
+        worker.onmessage?.({
+          data: {
+            type: "ONESHOT_HIGHLIGHT_RESPONSE",
+            messageId: message.messageId,
+            hasParser: true,
+            error: "forced one-shot worker failure",
+          } as TreeSitterWorkerResponse,
+        })
+      })
+    }
+
+    try {
+      await expect(oneShotClient.highlightOnce("const value = 1", "javascript")).rejects.toThrow(
+        "forced one-shot worker failure",
+      )
+    } finally {
+      await oneShotClient.destroy()
+    }
+  })
+
+  test("propagates one-shot initialization failure", async () => {
+    const oneShotClient = new TreeSitterClient({
+      dataPath,
+      workerPath: "invalid-path",
+      initTimeout: 500,
+    })
+
+    try {
+      await expect(oneShotClient.highlightOnce("const value = 1", "javascript")).rejects.toThrow()
+    } finally {
+      await oneShotClient.destroy()
+    }
+  })
+
+  test("clear cache waits for parser assets in use", async () => {
+    const javascript = (await getParsers()).find((parser) => parser.filetype === "javascript")
+    expect(javascript).toBeDefined()
+    if (!javascript) return
+
+    const wasm = await Bun.file(javascript.wasm).arrayBuffer()
+    const highlights = await Bun.file(javascript.queries.highlights[0]).text()
+    let releaseWasm!: () => void
+    let markWasmRequested!: () => void
+    const wasmGate = new Promise<void>((resolve) => {
+      releaseWasm = resolve
+    })
+    const wasmRequested = new Promise<void>((resolve) => {
+      markWasmRequested = resolve
+    })
+    const server = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        if (new URL(request.url).pathname.endsWith(".wasm")) {
+          markWasmRequested()
+          await wasmGate
+          return new Response(wasm)
+        }
+        return new Response(highlights)
+      },
+    })
+    const parserClient = new TreeSitterClient({
+      dataPath: join(dataPath, `parser-assets-owner-${crypto.randomUUID()}`),
+    })
+    let preload: Promise<boolean> | undefined
+
+    try {
+      await parserClient.initialize()
+      parserClient.addFiletypeParser({
+        filetype: "gated-javascript",
+        wasm: `http://127.0.0.1:${server.port}/parser.wasm`,
+        queries: { highlights: [`http://127.0.0.1:${server.port}/highlights.scm`] },
+      })
+
+      preload = parserClient.preloadParser("gated-javascript")
+      void preload.catch(() => undefined)
+      await wasmRequested
+      const clear = parserClient.clearCache()
+      // clear是cache owner barrier；在途asset使用释放前不得先报告完成。
+      expect(
+        await Promise.race([clear.then(() => "cleared" as const), Bun.sleep(200).then(() => "held" as const)]),
+      ).toBe("held")
+
+      releaseWasm()
+      expect(await preload).toBe(true)
+      await clear
+      expect(await parserClient.preloadParser("gated-javascript")).toBe(true)
+    } finally {
+      releaseWasm()
+      await preload?.catch(() => undefined)
+      await parserClient.destroy()
+      server.stop(true)
+    }
+  }, 15000)
 
   test("silences Code cancellation warnings after destruction", async () => {
     // 一个测试同时覆盖one-shot与streaming两条既有Code入口，避免新增第九个测试文件。

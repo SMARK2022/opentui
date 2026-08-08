@@ -487,8 +487,9 @@ export class MarkdownRenderable extends Renderable {
 
   private getCurrentMarkdownSeed(content: string, seed?: StyledText): StyledText | undefined {
     if (seed) return seed
-    // persistent Code在等待高亮时仍需使用当前content；这是正常表示阶段，不是失败后的替代渲染。
-    return this.createInitialStyledText({ type: "text", raw: content, text: content } as MarkedToken)
+    const chunks: TextChunk[] = []
+    this.renderInlineContent(Lexer.lexInline(content), chunks)
+    return chunks.length > 0 ? new StyledText(chunks) : undefined
   }
 
   private renderInlineContent(tokens: Token[], chunks: TextChunk[]): void {
@@ -655,7 +656,8 @@ export class MarkdownRenderable extends Renderable {
       fg: this._fg,
       bg: this._bg,
       conceal: this._conceal,
-      drawUnstyledText: currentSeed !== undefined,
+      // pending seed由Code提交；Markdown保持未高亮fallback关闭。
+      drawUnstyledText: false,
       streaming: true,
       initialStyledText: currentSeed,
       baseHighlight,
@@ -973,6 +975,9 @@ export class MarkdownRenderable extends Renderable {
   }
 
   private createCodeRenderable(token: Tokens.Code, id: string, marginBottom: number = 0): Renderable {
+    // fenced代码只在streaming等待高亮期间提供当前seed，同步代码块保持原始初始表示。
+    const currentSeed =
+      this._streaming && token.text.length > 0 ? new StyledText([this.createDefaultChunk(token.text)]) : undefined
     return new CodeRenderable(this.ctx, {
       id,
       content: token.text,
@@ -982,6 +987,7 @@ export class MarkdownRenderable extends Renderable {
       bg: this._bg,
       conceal: this._concealCode,
       drawUnstyledText: !this._streaming,
+      initialStyledText: currentSeed,
       streaming: this._streaming,
       treeSitterClient: this._treeSitterClient,
       width: "100%",
@@ -997,6 +1003,7 @@ export class MarkdownRenderable extends Renderable {
     initialStyledText?: StyledText,
   ): void {
     // seed与content必须来自同一次token更新，否则异步高亮期间会暴露空的正文缓冲。
+    renderable.streaming = true
     const currentSeed = this.getCurrentMarkdownSeed(content, initialStyledText)
     renderable.initialStyledText = currentSeed
     renderable.filetype = "markdown"
@@ -1004,8 +1011,8 @@ export class MarkdownRenderable extends Renderable {
     renderable.fg = this._fg
     renderable.bg = this._bg
     renderable.conceal = this._conceal
-    renderable.drawUnstyledText = currentSeed !== undefined
-    renderable.streaming = true
+    // pending seed由Code提交；Markdown保持未高亮fallback关闭。
+    renderable.drawUnstyledText = false
     renderable.baseHighlight = baseHighlight
     renderable.content = content
     renderable.marginBottom = marginBottom
@@ -1046,6 +1053,10 @@ export class MarkdownRenderable extends Renderable {
   private applyCodeBlockRenderable(renderable: Renderable, token: Tokens.Code, marginBottom: number): void {
     if (!(renderable instanceof CodeRenderable)) return
 
+    // 复用fenced代码节点时沿用同一plain seed，确保新token在下一次高亮完成前可见。
+    const currentSeed =
+      this._streaming && token.text.length > 0 ? new StyledText([this.createDefaultChunk(token.text)]) : undefined
+    renderable.initialStyledText = currentSeed
     renderable.filetype = infoStringToFiletype(token.lang ?? "")
     renderable.syntaxStyle = this._syntaxStyle
     renderable.fg = this._fg

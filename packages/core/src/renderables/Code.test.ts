@@ -266,7 +266,7 @@ test("CodeRenderable - uses fallback rendering when no filetype provided", async
   expect(codeRenderable.plainText).toBe("const message = 'hello world';")
 })
 
-test("CodeRenderable - uses fallback rendering when highlighting throws error", async () => {
+test("CodeRenderable - does not commit plain text when highlighting throws", async () => {
   const syntaxStyle = SyntaxStyle.fromStyles({
     default: { fg: RGBA.fromValues(1, 1, 1, 1) },
   })
@@ -284,6 +284,7 @@ test("CodeRenderable - uses fallback rendering when highlighting throws error", 
     syntaxStyle,
     treeSitterClient: mockClient,
     conceal: false,
+    drawUnstyledText: false,
   })
 
   currentRenderer.root.add(codeRenderable)
@@ -294,7 +295,8 @@ test("CodeRenderable - uses fallback rendering when highlighting throws error", 
 
   expect(codeRenderable.content).toBe("const message = 'hello world';")
   expect(codeRenderable.filetype).toBe("javascript")
-  expect(codeRenderable.plainText).toBe("const message = 'hello world';")
+  // 失败不应把一次高亮请求伪装成成功的可见原文。
+  expect(captureFrame()).not.toContain("const message = 'hello world';")
 })
 
 test("CodeRenderable - handles empty content", async () => {
@@ -899,7 +901,7 @@ test("CodeRenderable - updating drawUnstyledText from true to false triggers re-
   await waitForHighlight(codeRenderable)
 })
 
-test("CodeRenderable - uses fallback rendering on error even with drawUnstyledText=false", async () => {
+test("CodeRenderable - keeps failed drawUnstyledText=false output non-successful", async () => {
   const syntaxStyle = SyntaxStyle.fromStyles({
     default: { fg: RGBA.fromValues(1, 1, 1, 1) },
   })
@@ -926,7 +928,8 @@ test("CodeRenderable - uses fallback rendering on error even with drawUnstyledTe
   await waitForHighlight(codeRenderable)
   await renderOnce()
 
-  expect(codeRenderable.plainText).toBe("const message = 'hello world';")
+  // 正常seed由Markdown路径提供；本测试只锁定失败不能提交fallback正文。
+  expect(captureFrame()).not.toContain("const message = 'hello world';")
 })
 
 test("CodeRenderable - with drawUnstyledText=false and no filetype, fallback is used", async () => {
@@ -2352,7 +2355,7 @@ test("CodeRenderable - streaming with conceal and drawUnstyledText=false should 
   expect(finalFrameText).not.toContain("```")
 })
 
-test("CodeRenderable - streaming with drawUnstyledText=false falls back to unstyled text when highlights fail", async () => {
+test("CodeRenderable - streaming with drawUnstyledText=false does not commit unstyled text when highlights fail", async () => {
   const syntaxStyle = SyntaxStyle.fromStyles({
     default: { fg: RGBA.fromValues(1, 1, 1, 1) },
   })
@@ -2386,7 +2389,7 @@ test("CodeRenderable - streaming with drawUnstyledText=false falls back to unsty
   await waitForHighlight(codeRenderable)
   await renderOnce()
 
-  expect(codeRenderable.plainText).toBe("const updated = 'world';")
+  expect(codeRenderable.plainText).toBe("const initial = 'hello';")
 })
 
 const createRealMarkdownClient = async () => {

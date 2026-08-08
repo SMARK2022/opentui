@@ -102,13 +102,13 @@ export class CodeRenderable extends TextBufferRenderable {
     this._onChunks = options.onChunks
 
     if (this._content.length > 0) {
-      if (this._initialStyledText && this._drawUnstyledText) {
+      if (this._initialStyledText) {
         this.textBuffer.setStyledText(this._initialStyledText)
       } else {
         this.textBuffer.setText(this._content)
       }
       this.updateTextInfo()
-      this._shouldRenderTextBuffer = this._drawUnstyledText || !this._filetype
+      this._shouldRenderTextBuffer = !!this._initialStyledText || this._drawUnstyledText || !this._filetype
     }
 
     this._highlightsDirty = this._content.length > 0
@@ -125,6 +125,7 @@ export class CodeRenderable extends TextBufferRenderable {
       this._highlightSnapshotId++
 
       if (this._streaming && this._filetype && !this._drawUnstyledText) {
+        if (this._initialStyledText) this.commitPendingRepresentation()
         this.requestRender()
         return
       }
@@ -327,19 +328,27 @@ export class CodeRenderable extends TextBufferRenderable {
     const isInitialContent = this._streaming && !this._hadInitialContent
     const shouldDrawUnstyledNow = this._streaming ? isInitialContent && this._drawUnstyledText : this._drawUnstyledText
 
-    if (this._streaming && !isInitialContent) {
+    if (this._initialStyledText) {
+      this.commitPendingRepresentation()
+    } else if (this._streaming && !isInitialContent) {
       this._shouldRenderTextBuffer = true
     } else if (shouldDrawUnstyledNow) {
-      if (this._initialStyledText) {
-        this.textBuffer.setStyledText(this._initialStyledText)
-      } else {
-        this.textBuffer.setText(content)
-      }
-      this.setRenderedLineSources(undefined)
-      this._shouldRenderTextBuffer = true
+      this.commitPendingRepresentation()
     } else {
       this._shouldRenderTextBuffer = false
     }
+  }
+
+  private commitPendingRepresentation(): void {
+    // 异步高亮未完成时先提交当前表示，保持正文可见且不把未高亮模式变成常开成功路径。
+    if (this._initialStyledText) {
+      this.textBuffer.setStyledText(this._initialStyledText)
+    } else {
+      this.textBuffer.setText(this._content)
+    }
+    this.setRenderedLineSources(undefined)
+    this._shouldRenderTextBuffer = true
+    this.updateTextInfo()
   }
 
   private startHighlight(): Promise<void> {
@@ -441,13 +450,10 @@ export class CodeRenderable extends TextBufferRenderable {
           }
           // renderable先销毁但live error后到时也不应在退出阶段制造噪声。
           if (this.isDestroyed) continue
-          console.warn("Code streaming highlight failed, falling back to plain text:", error)
-          // 失败帧的缓存状态不再可信：丢弃后下一帧从全量转换重建。
+          console.warn("Code streaming highlight failed:", error)
+          // 失败只使缓存失效；当前表示由正常seed/既有TextBuffer拥有，不能伪装成成功高亮。
           this._prefixCache = undefined
           this._cachedHighlights = []
-          this.textBuffer.setText(content)
-          this.setRenderedLineSources(undefined)
-          this.commitStreamingVisible()
         }
       }
     } finally {
@@ -472,7 +478,10 @@ export class CodeRenderable extends TextBufferRenderable {
     const cacheEnd = this._onHighlight ? 0 : (this._prefixCache?.end ?? 0)
     const clipStart = Math.min(result.changedStart, result.tailStart, cacheEnd)
     // 增量合并还原全量 highlights：onHighlight 合同与 conceal 行映射都依赖完整范围。
-    this._cachedHighlights = [...this._cachedHighlights.filter((highlight) => highlight[1] <= clipStart), ...result.highlights]
+    this._cachedHighlights = [
+      ...this._cachedHighlights.filter((highlight) => highlight[1] <= clipStart),
+      ...result.highlights,
+    ]
 
     let highlights = this._cachedHighlights
     if (this._onHighlight) {
@@ -534,7 +543,12 @@ export class CodeRenderable extends TextBufferRenderable {
     this.commitStreamingVisible()
   }
 
-  private convertHighlightRegion(content: string, highlights: SimpleHighlight[], start: number, end: number): TextChunk[] {
+  private convertHighlightRegion(
+    content: string,
+    highlights: SimpleHighlight[],
+    start: number,
+    end: number,
+  ): TextChunk[] {
     // 全范围转换与既有 one-shot 走完全相同的调用，不经过 slice，避免两种路径产生任何行为分叉。
     if (start === 0 && end === content.length) {
       return treeSitterToTextChunks(content, highlights, this._syntaxStyle, {
@@ -667,10 +681,7 @@ export class CodeRenderable extends TextBufferRenderable {
       }
 
       if (this.isDestroyed) return
-      console.warn("Code highlighting failed, falling back to plain text:", error)
-      this.textBuffer.setText(content)
-      this.setRenderedLineSources(undefined)
-      this._shouldRenderTextBuffer = true
+      console.warn("Code highlighting failed:", error)
       this._isHighlighting = false
       this._highlightsDirty = false
       this.updateTextInfo()

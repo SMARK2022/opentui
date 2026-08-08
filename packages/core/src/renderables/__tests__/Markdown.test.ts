@@ -1483,13 +1483,17 @@ test("streaming structured list updates keep previous item text visible while hi
   await renderOnce()
   const updatedHighlights = getPendingMarkdownParagraphHighlights(md)
   expect(updatedHighlights.length).toBeGreaterThan(0)
+  // 高亮请求未完成时，当前seed必须可见且不能改成常开未高亮模式。
+  for (const codeBlock of updatedHighlights) {
+    expect(codeBlock.drawUnstyledText).toBe(false)
+  }
 
   const framesBeforeHighlight = recorder.recordedFrames.map((recorded) => recorded.frame)
   expect(framesBeforeHighlight.length).toBeGreaterThan(0)
   for (const frame of framesBeforeHighlight) {
-    expect(frame).toContain("- alp")
-    expect(frame).toContain("- bet")
-    expect(frame).toContain("- gam")
+    expect(frame).toContain("- alpha")
+    expect(frame).toContain("- beta")
+    expect(frame).toContain("- gamma")
   }
 
   expect(mockTreeSitterClient.pendingStreamingUpdates()).toBeGreaterThan(0)
@@ -3092,7 +3096,7 @@ test("streaming mode keeps trailing tokens unstable", async () => {
   expect(frame2).toContain("Hello World")
 })
 
-test("streaming code blocks with concealCode=true do not flash unconcealed markdown", async () => {
+test("streaming code blocks with concealCode=true show a seed before conceal highlighting", async () => {
   const mockTreeSitterClient = createMockTreeSitterClient()
   // conceal 高亮走 persistent streaming 结果通道；挂起更新才能观察“未高亮帧不得闪现原文”的窗口。
   mockTreeSitterClient.streamingAutoResolve = false
@@ -3129,11 +3133,14 @@ test("streaming code blocks with concealCode=true do not flash unconcealed markd
   recorder.stop()
 
   const frames = recorder.recordedFrames.map((frame) => frame.frame)
-  const unconcealedFrames = frames.filter((frame) => frame.includes("# Hidden heading"))
-  expect(unconcealedFrames.length).toBe(0)
+  const pendingSeedFrames = frames.filter((frame) => frame.includes("# Hidden heading"))
+  expect(pendingSeedFrames.length).toBeGreaterThan(0)
+  const settledFrame = frames[frames.length - 1] ?? ""
+  expect(settledFrame).not.toContain("# Hidden heading")
+  expect(settledFrame).toContain("Hidden heading")
 })
 
-test("streaming demo-style fenced code block does not flicker unhighlighted", async () => {
+test("streaming demo-style fenced code block shows a seed before syntax highlighting", async () => {
   const keywordFg = RGBA.fromValues(1, 0, 0, 1)
   const defaultFg = RGBA.fromValues(1, 1, 1, 1)
   const mockTreeSitterClient = new MockTreeSitterClient()
@@ -3193,6 +3200,10 @@ The fenced block above appears near the top so streaming mode exercises a larger
   const codeBlock = md._blockStates.find((state) => state.token.type === "code")?.renderable
   expect(codeBlock).toBeInstanceOf(CodeRenderable)
   expect(mockTreeSitterClient.isHighlighting()).toBe(true)
+  // fenced code也必须在one-shot高亮完成前显示当前token，而不是等待时留下空白。
+  expect((codeBlock as CodeRenderable).drawUnstyledText).toBe(false)
+  const pendingFrames = recorder.recordedFrames.map((recorded) => recorded.frame)
+  expect(pendingFrames.some((frame) => frame.includes("export function appendMarkdownChunk"))).toBe(true)
   mockTreeSitterClient.resolveAllHighlightOnce()
   await (codeBlock as CodeRenderable).highlightingDone
   await renderer.idle()
@@ -3226,7 +3237,8 @@ The fenced block above appears near the top so streaming mode exercises a larger
 
   expect(visibleCodeFrames.length).toBeGreaterThan(0)
   expect(visibleCodeFrames.some((frame) => frame.exportFg!.join(",") === expectedKeywordFg.join(","))).toBe(true)
-  expect(visibleCodeFrames.filter((frame) => frame.exportFg!.join(",") !== expectedKeywordFg.join(","))).toEqual([])
+  expect(visibleCodeFrames.some((frame) => frame.exportFg!.join(",") === defaultFg.buffer.join(","))).toBe(true)
+  expect(visibleCodeFrames[visibleCodeFrames.length - 1]?.exportFg?.join(",")).toBe(expectedKeywordFg.join(","))
 })
 
 test("non-streaming mode parses all tokens as stable", async () => {

@@ -224,6 +224,8 @@ export class CodeRenderable extends TextBufferRenderable {
   set drawUnstyledText(value: boolean) {
     if (this._drawUnstyledText !== value) {
       this._drawUnstyledText = value
+      // 该 setter 改变 failure 后的可见语义，必须让在途请求被既有 generation 检查识别。
+      this._cacheGeneration++
       this._highlightsDirty = true
     }
   }
@@ -235,6 +237,12 @@ export class CodeRenderable extends TextBufferRenderable {
   set initialStyledText(value: StyledText | undefined) {
     if (this._initialStyledText !== value) {
       this._initialStyledText = value
+      if (this._streamingActive) {
+        // active request 中 seed 只属于等待期表示；清空 seed 不能提前打开未高亮正文。
+        if (value) this.commitPendingRepresentation()
+        this.requestRender()
+        return
+      }
       this._highlightsDirty = true
     }
   }
@@ -296,6 +304,8 @@ export class CodeRenderable extends TextBufferRenderable {
   set onChunks(value: OnChunksCallback | undefined) {
     if (this._onChunks !== value) {
       this._onChunks = value
+      // callback 会改变最终 chunk 文本，失败结算必须保留这次渲染语义失效。
+      this._cacheGeneration++
       this._highlightsDirty = true
     }
   }
@@ -407,6 +417,8 @@ export class CodeRenderable extends TextBufferRenderable {
         this._streamingPending = undefined
         // snapshot 在取出内容时记录；之后的每个 await 点都要用它验证自己不是旧帧。
         const snapshot = this._highlightSnapshotId
+        // failure 结算要区分 pending seed 变化和真正改变渲染缓存语义的 setter。
+        const requestCacheGeneration = this._cacheGeneration
 
         try {
           if (this._streamingBufferId === undefined) {
@@ -451,9 +463,17 @@ export class CodeRenderable extends TextBufferRenderable {
           // renderable先销毁但live error后到时也不应在退出阶段制造噪声。
           if (this.isDestroyed) continue
           console.warn("Code streaming highlight failed:", error)
-          // 失败只使缓存失效；当前表示由正常seed/既有TextBuffer拥有，不能伪装成成功高亮。
+          // rejection 必须提交本请求的原文；pending seed 可独立变化，不能作为失败终态。
           this._prefixCache = undefined
           this._cachedHighlights = []
+          this.textBuffer.setText(content)
+          this.setRenderedLineSources(undefined)
+          // 失败只恢复当前帧可见性；只有真正改变缓存语义的在途 setter 才保留 dirty。
+          this._shouldRenderTextBuffer = true
+          // active seed 不会置 dirty；此处只保留在途渲染语义 setter 的 cache invalidation。
+          this._highlightsDirty = requestCacheGeneration !== this._cacheGeneration
+          this.updateTextInfo()
+          this.requestRender()
         }
       }
     } finally {
@@ -682,6 +702,10 @@ export class CodeRenderable extends TextBufferRenderable {
 
       if (this.isDestroyed) return
       console.warn("Code highlighting failed:", error)
+      // failure 终态只能提交本次请求捕获的原文，不能读取可能已变更的 pending seed。
+      this.textBuffer.setText(content)
+      this.setRenderedLineSources(undefined)
+      this._shouldRenderTextBuffer = true
       this._isHighlighting = false
       this._highlightsDirty = false
       this.updateTextInfo()

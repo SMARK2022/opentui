@@ -7,6 +7,7 @@ import { ManualClock } from "../testing/manual-clock.js"
 import { tmpdir } from "os"
 import { join } from "path"
 import { TreeSitterClient } from "../lib/tree-sitter/index.js"
+import { stringToStyledText } from "../lib/styled-text.js"
 import type { SimpleHighlight } from "../lib/tree-sitter/types.js"
 import { BoxRenderable } from "./Box.js"
 import { TextAttributes, type CapturedFrame } from "../types.js"
@@ -266,9 +267,10 @@ test("CodeRenderable - uses fallback rendering when no filetype provided", async
   expect(codeRenderable.plainText).toBe("const message = 'hello world';")
 })
 
-test("CodeRenderable - does not commit plain text when highlighting throws", async () => {
+test("CodeRenderable - commits unstyled plain text when highlighting throws", async () => {
   const syntaxStyle = SyntaxStyle.fromStyles({
     default: { fg: RGBA.fromValues(1, 1, 1, 1) },
+    keyword: { fg: RGBA.fromValues(1, 0, 0, 1) },
   })
 
   const mockClient = new MockTreeSitterClient()
@@ -295,8 +297,9 @@ test("CodeRenderable - does not commit plain text when highlighting throws", asy
 
   expect(codeRenderable.content).toBe("const message = 'hello world';")
   expect(codeRenderable.filetype).toBe("javascript")
-  // 失败不应把一次高亮请求伪装成成功的可见原文。
-  expect(captureFrame()).not.toContain("const message = 'hello world';")
+  // 失败仍须显示当前原文，但没有 keyword 着色，避免把 rejected highlight 当成成功。
+  expect(captureFrame()).toContain("const message = 'hello world';")
+  expect(findSpanContaining(captureSpans(), "const message")?.fg?.equals(RGBA.fromValues(1, 0, 0, 1))).toBe(false)
 })
 
 test("CodeRenderable - handles empty content", async () => {
@@ -901,9 +904,10 @@ test("CodeRenderable - updating drawUnstyledText from true to false triggers re-
   await waitForHighlight(codeRenderable)
 })
 
-test("CodeRenderable - keeps failed drawUnstyledText=false output non-successful", async () => {
+test("CodeRenderable - keeps failed drawUnstyledText=false output visible and unstyled", async () => {
   const syntaxStyle = SyntaxStyle.fromStyles({
     default: { fg: RGBA.fromValues(1, 1, 1, 1) },
+    keyword: { fg: RGBA.fromValues(1, 0, 0, 1) },
   })
 
   const mockClient = new MockTreeSitterClient()
@@ -928,8 +932,9 @@ test("CodeRenderable - keeps failed drawUnstyledText=false output non-successful
   await waitForHighlight(codeRenderable)
   await renderOnce()
 
-  // 正常seed由Markdown路径提供；本测试只锁定失败不能提交fallback正文。
-  expect(captureFrame()).not.toContain("const message = 'hello world';")
+  // failure 的可见 plain text 不能携带成功 highlight 的 keyword 颜色。
+  expect(captureFrame()).toContain("const message = 'hello world';")
+  expect(findSpanContaining(captureSpans(), "const message")?.fg?.equals(RGBA.fromValues(1, 0, 0, 1))).toBe(false)
 })
 
 test("CodeRenderable - with drawUnstyledText=false and no filetype, fallback is used", async () => {
@@ -2355,7 +2360,7 @@ test("CodeRenderable - streaming with conceal and drawUnstyledText=false should 
   expect(finalFrameText).not.toContain("```")
 })
 
-test("CodeRenderable - streaming with drawUnstyledText=false does not commit unstyled text when highlights fail", async () => {
+test("CodeRenderable - streaming with drawUnstyledText=false commits the failed snapshot as plain text", async () => {
   const syntaxStyle = SyntaxStyle.fromStyles({
     default: { fg: RGBA.fromValues(1, 1, 1, 1) },
   })
@@ -2389,7 +2394,9 @@ test("CodeRenderable - streaming with drawUnstyledText=false does not commit uns
   await waitForHighlight(codeRenderable)
   await renderOnce()
 
-  expect(codeRenderable.plainText).toBe("const initial = 'hello';")
+  // streaming setter 会保留旧 buffer；failure catch 必须提交这次失败的 current source。
+  expect(codeRenderable.plainText).toBe("const updated = 'world';")
+  expect(captureFrame()).toContain("const updated = 'world';")
 })
 
 const createRealMarkdownClient = async () => {
@@ -2746,8 +2753,346 @@ test("CodeRenderable streaming markdown - managed rejection commits current plai
 
   // 失败快照的唯一兼容行为：显示当前原文 plain text，且不触发该快照的成功回调。
   expect(codeRenderable.plainText).toBe("# broken\n")
+  // plainText 在当前缺陷中仍然正确；只有 frame 断言能锁定用户实际看见的空白卡片。
+  expect(captureFrame()).toContain("# broken")
   expect(onHighlightCalls).toBe(0)
   expect(onChunksCalls).toBe(0)
+  // 普通 rejection 只结算当前失败帧；后续普通重绘不得把它变成自动 retry。
+  expect(mockClient.pendingStreamingUpdates()).toBe(0)
+  await renderOnce()
+  // 两次零 pending 分别覆盖失败结算和下一次普通绘制，排除延迟调度的隐性 retry。
+  expect(mockClient.pendingStreamingUpdates()).toBe(0)
+})
+
+test("CodeRenderable streaming rejection preserves a style invalidation for one replacement update", async () => {
+  const mockClient = new MockTreeSitterClient()
+  mockClient.streamingAutoResolve = false
+
+  const styleA = SyntaxStyle.fromStyles({
+    default: { fg: RGBA.fromValues(1, 1, 1, 1) },
+    "markup.heading.1": { fg: RGBA.fromValues(0, 0, 1, 1) },
+  })
+  const styleB = SyntaxStyle.fromStyles({
+    default: { fg: RGBA.fromValues(1, 1, 1, 1) },
+    "markup.heading.1": { fg: RGBA.fromValues(1, 0, 0, 1) },
+  })
+  // 两套 style 使用不同 heading 颜色，能独立证明 replacement 读到了新的渲染语义。
+  mockClient.setStreamingResultHandler((content) => ({
+    version: 1,
+    changedStart: content.length,
+    tailStart: 0,
+    highlights: [[0, 3, "markup.heading.1"]],
+  }))
+
+  const codeRenderable = new CodeRenderable(currentRenderer, {
+    id: "streaming-md-rejection-style-replacement",
+    content: "# H\n",
+    filetype: "markdown",
+    syntaxStyle: styleA,
+    treeSitterClient: mockClient,
+    streaming: true,
+    drawUnstyledText: false,
+    conceal: false,
+    left: 0,
+    top: 0,
+  })
+
+  currentRenderer.root.add(codeRenderable)
+  await renderOnce()
+  // 先确认原请求已发出，再注入 setter 变化，确保覆盖真实 in-flight 时序。
+  expect(mockClient.pendingStreamingUpdates()).toBe(1)
+
+  // 在途样式变更属于较新的渲染语义，原请求失败后必须由既有 dirty gate 重新处理。
+  codeRenderable.syntaxStyle = styleB
+  mockClient.rejectStreamingUpdate(0)
+  await waitForHighlight(codeRenderable)
+
+  await renderOnce()
+  expect(mockClient.pendingStreamingUpdates()).toBe(1)
+  // 这里只放行 replacement request；如果 failure 自己 retry，会出现第二个 pending。
+  mockClient.resolveStreamingUpdate(0)
+  await waitForHighlight(codeRenderable)
+  await renderOnce()
+
+  // replacement 成功后使用新样式，并且后续普通重绘不应再制造第二个请求。
+  const heading = findSpanContaining(captureSpans(), "# H")
+  expect(heading).toBeDefined()
+  expect(heading!.fg.equals(RGBA.fromValues(1, 0, 0, 1))).toBe(true)
+  await renderOnce()
+  expect(mockClient.pendingStreamingUpdates()).toBe(0)
+})
+
+test("CodeRenderable streaming rejection preserves a drawUnstyledText invalidation for one replacement update", async () => {
+  const mockClient = new MockTreeSitterClient()
+  // 手动挂起 worker，才能把 setter 变化放在真实 rejection 的 in-flight 窗口内。
+  mockClient.streamingAutoResolve = false
+
+  const codeRenderable = new CodeRenderable(currentRenderer, {
+    id: "streaming-md-rejection-unstyled-replacement",
+    content: "# H\n",
+    filetype: "markdown",
+    syntaxStyle: streamingSyntaxStyle(),
+    treeSitterClient: mockClient,
+    streaming: true,
+    drawUnstyledText: false,
+    conceal: false,
+    left: 0,
+    top: 0,
+  })
+
+  currentRenderer.root.add(codeRenderable)
+  await renderOnce()
+  expect(mockClient.pendingStreamingUpdates()).toBe(1)
+
+  // 可见性模式变化属于渲染语义，不是 seed 更新，失败后必须保留一次重高亮。
+  codeRenderable.drawUnstyledText = true
+  mockClient.rejectStreamingUpdate(0)
+  await waitForHighlight(codeRenderable)
+  await renderOnce()
+
+  // drawUnstyledText 是 failure 后仍影响可见语义的 setter，必须保留一次 replacement。
+  expect(mockClient.pendingStreamingUpdates()).toBe(1)
+  // 只放行这一条 replacement，下一次普通绘制用来检查不会重复调度。
+  mockClient.resolveStreamingUpdate(0)
+  await waitForHighlight(codeRenderable)
+  await renderOnce()
+  expect(mockClient.pendingStreamingUpdates()).toBe(0)
+})
+
+test("CodeRenderable streaming rejection preserves an onChunks invalidation for one replacement update", async () => {
+  const mockClient = new MockTreeSitterClient()
+  // callback 变化要等原请求拒绝后再观察，避免把初始配置误当成 replacement 证据。
+  mockClient.streamingAutoResolve = false
+
+  const codeRenderable = new CodeRenderable(currentRenderer, {
+    id: "streaming-md-rejection-chunks-replacement",
+    content: "hello\n",
+    filetype: "markdown",
+    syntaxStyle: streamingSyntaxStyle(),
+    treeSitterClient: mockClient,
+    streaming: true,
+    drawUnstyledText: false,
+    conceal: false,
+    left: 0,
+    top: 0,
+  })
+
+  currentRenderer.root.add(codeRenderable)
+  await renderOnce()
+  expect(mockClient.pendingStreamingUpdates()).toBe(1)
+
+  // uppercase 是独立可见结果，用来证明 replacement 真正执行了新 callback。
+  codeRenderable.onChunks = (chunks) => chunks.map((chunk) => ({ ...chunk, text: chunk.text.toUpperCase() }))
+  mockClient.rejectStreamingUpdate(0)
+  await waitForHighlight(codeRenderable)
+  await renderOnce()
+
+  // callback 语义必须在 replacement 中真正生效，而不是只留下 dirty 标志。
+  expect(mockClient.pendingStreamingUpdates()).toBe(1)
+  // callback replacement 成功后再检查空队列，区分一次重处理和持续重试。
+  mockClient.resolveStreamingUpdate(0)
+  await waitForHighlight(codeRenderable)
+  await renderOnce()
+
+  expect(captureFrame()).toContain("HELLO")
+  expect(captureFrame()).not.toContain("hello")
+  await renderOnce()
+  expect(mockClient.pendingStreamingUpdates()).toBe(0)
+})
+
+test("CodeRenderable streaming rejection uses request source after initialStyledText changes", async () => {
+  const mockClient = new MockTreeSitterClient()
+  mockClient.streamingAutoResolve = false
+
+  const codeRenderable = new CodeRenderable(currentRenderer, {
+    id: "streaming-md-seed-mutation",
+    content: "# request source\n",
+    filetype: "markdown",
+    syntaxStyle: streamingSyntaxStyle(),
+    treeSitterClient: mockClient,
+    streaming: true,
+    drawUnstyledText: false,
+    initialStyledText: stringToStyledText("# request source\n"),
+    left: 0,
+    top: 0,
+  })
+
+  currentRenderer.root.add(codeRenderable)
+  await renderOnce()
+  expect(mockClient.pendingStreamingUpdates()).toBe(1)
+
+  // 这是 CodeRenderable public setter 边界测试，不假设 Markdown 正常只更新 seed 不更新 content。
+  codeRenderable.initialStyledText = stringToStyledText("MUTATED SEED\n")
+  mockClient.rejectStreamingUpdate(0)
+  await waitForHighlight(codeRenderable)
+  await renderOnce()
+
+  // rejection 只能提交已捕获的 request source，不能读取请求期间变更的 pending seed。
+  expect(codeRenderable.plainText).toBe("# request source\n")
+  expect(captureFrame()).toContain("# request source")
+  expect(captureFrame()).not.toContain("MUTATED SEED")
+})
+
+test("CodeRenderable active seed mutation does not enqueue a replacement after rejection", async () => {
+  const mockClient = new MockTreeSitterClient()
+  mockClient.streamingAutoResolve = false
+
+  const codeRenderable = new CodeRenderable(currentRenderer, {
+    id: "streaming-md-active-seed-render",
+    content: "# request source\n",
+    filetype: "markdown",
+    syntaxStyle: streamingSyntaxStyle(),
+    treeSitterClient: mockClient,
+    streaming: true,
+    drawUnstyledText: false,
+    initialStyledText: stringToStyledText("# request source\n"),
+    left: 0,
+    top: 0,
+  })
+
+  // active 标志必须来自真实 streaming loop，而不是仅由 streaming/filetype 配置推断。
+  currentRenderer.root.add(codeRenderable)
+  await renderOnce()
+  // 该 pending 请求是唯一允许被 reject 的原请求，后续 seed 不应增加队列项。
+  expect(mockClient.pendingStreamingUpdates()).toBe(1)
+
+  // setter 后先 render，覆盖审计发现的“seed 变化进入 _streamingPending”时序。
+  codeRenderable.initialStyledText = stringToStyledText("MUTATED SEED\n")
+  // 普通 render 只提交等待期表示，不应启动第二条 primary 请求。
+  await renderOnce()
+  // rejection 后立即观察 queue，避免 waitForHighlight 掩盖隐性 replacement。
+  mockClient.rejectStreamingUpdate(0)
+  await flushAsync()
+
+  try {
+    // Seed-only rendering must not become a new request when the same source request rejects。
+    expect(mockClient.pendingStreamingUpdates()).toBe(0)
+  } finally {
+    mockClient.resolveAllStreamingUpdates()
+    await waitForHighlight(codeRenderable)
+  }
+
+  await renderOnce()
+  expect(codeRenderable.plainText).toBe("# request source\n")
+  expect(captureFrame()).toContain("# request source")
+})
+
+test("CodeRenderable active empty seed preserves waiting visibility and does not retry after rejection", async () => {
+  const mockClient = new MockTreeSitterClient()
+  // 空 seed slice 需要手动控制原请求，才能区分隐藏 frame 与实际 no-retry 合同。
+  mockClient.streamingAutoResolve = false
+
+  const codeRenderable = new CodeRenderable(currentRenderer, {
+    // 使用与 content 不同的 seed，才能证明清空后没有偷偷显示 unstyled source。
+    id: "streaming-md-empty-seed",
+    content: "# request source\n",
+    filetype: "markdown",
+    syntaxStyle: streamingSyntaxStyle(),
+    treeSitterClient: mockClient,
+    streaming: true,
+    drawUnstyledText: false,
+    initialStyledText: stringToStyledText("PENDING SEED\n"),
+    left: 0,
+    top: 0,
+  })
+
+  currentRenderer.root.add(codeRenderable)
+  await renderOnce()
+  expect(mockClient.pendingStreamingUpdates()).toBe(1)
+
+  // 清空 seed 不代表允许 drawUnstyledText=false 提前显示当前 source。
+  codeRenderable.initialStyledText = undefined
+  // render 后仍应停留在原 pending 表示，且不能写入 streaming queue。
+  await renderOnce()
+  // 先锁定等待期 frame，再继续测试 rejection 后的 no-retry 合同。
+  expect(captureFrame()).toContain("PENDING SEED")
+  expect(captureFrame()).not.toContain("# request source")
+
+  // 原请求拒绝后必须直接进入终态 plain source，而不是消费 seed-only 产生的 replacement。
+  mockClient.rejectStreamingUpdate(0)
+  await flushAsync()
+  try {
+    // The visibility check alone is insufficient: rejection must also leave no queued replacement.
+    // 这里必须在原请求结算后观察队列，才能捕获 seed-only 造成的延迟 replacement。
+    expect(mockClient.pendingStreamingUpdates()).toBe(0)
+  } finally {
+    mockClient.resolveAllStreamingUpdates()
+    await waitForHighlight(codeRenderable)
+  }
+
+  await renderOnce()
+  // empty seed 只影响等待期表示；rejection 终态仍必须回到本次请求捕获的 plain source。
+  expect(codeRenderable.plainText).toBe("# request source\n")
+  expect(captureFrame()).toContain("# request source")
+})
+
+test("CodeRenderable settled streaming seed mutation re-highlights authoritative content", async () => {
+  const mockClient = new MockTreeSitterClient()
+  // settled slice 必须使用自动完成 client，确保 setter 前 _streamingActive 已回到 false。
+  const codeRenderable = new CodeRenderable(currentRenderer, {
+    id: "streaming-md-settled-seed",
+    content: "# authoritative\n",
+    filetype: "markdown",
+    syntaxStyle: streamingSyntaxStyle(),
+    treeSitterClient: mockClient,
+    streaming: true,
+    drawUnstyledText: false,
+    initialStyledText: stringToStyledText("# authoritative\n"),
+    left: 0,
+    top: 0,
+  })
+
+  currentRenderer.root.add(codeRenderable)
+  await renderOnce()
+  await waitForHighlight(codeRenderable)
+  await renderOnce()
+
+  // settled 状态不能把新 seed 当 terminal representation，必须重新消费 authoritative content。
+  codeRenderable.initialStyledText = stringToStyledText("MUTATED SEED\n")
+  // 该 render 应由 inactive setter 保留的 primary dirty 驱动新的 streaming request。
+  await renderOnce()
+  await waitForHighlight(codeRenderable)
+  await renderOnce()
+
+  // 最终文本来自 content，而不是 setter 传入的 pending seed。
+  expect(codeRenderable.plainText).toBe("# authoritative\n")
+  expect(captureFrame()).toContain("# authoritative")
+  expect(captureFrame()).not.toContain("MUTATED SEED")
+})
+
+test("CodeRenderable non-streaming seed mutation keeps the one-shot primary path", async () => {
+  const mockClient = new MockTreeSitterClient()
+  // 非 streaming 不存在 active pending loop，seed setter 必须保留 one-shot dirty path。
+  const codeRenderable = new CodeRenderable(currentRenderer, {
+    id: "one-shot-seed-mutation",
+    content: "const authoritative = true\n",
+    filetype: "javascript",
+    syntaxStyle: streamingSyntaxStyle(),
+    treeSitterClient: mockClient,
+    initialStyledText: stringToStyledText("STALE SEED\n"),
+    left: 0,
+    top: 0,
+  })
+
+  // 初次 render 建立 one-shot 请求，后续 setter slice 单独验证兼容路径。
+  currentRenderer.root.add(codeRenderable)
+  await renderOnce()
+  mockClient.resolveHighlightOnce(0)
+  await waitForHighlight(codeRenderable)
+  await renderOnce()
+
+  // 相同文本的新 StyledText 仍是一次 public mutation，必须保留 primary scheduling。
+  codeRenderable.initialStyledText = stringToStyledText("STALE SEED\n")
+  // one-shot replacement 完成后，TextBuffer 必须回到 authoritative content。
+  await renderOnce()
+  mockClient.resolveHighlightOnce(0)
+  await waitForHighlight(codeRenderable)
+  await renderOnce()
+
+  // 该断言排除“seed 可见但 highlight 没有重新运行”的兼容性回归。
+  expect(codeRenderable.plainText).toBe("const authoritative = true\n")
+  expect(captureFrame()).toContain("const authoritative = true")
+  expect(captureFrame()).not.toContain("STALE SEED")
 })
 
 test("CodeRenderable streaming markdown - onChunks receives the complete current chunk stream for every delta", async () => {

@@ -8,6 +8,10 @@ export interface AudioSetupOptions {
   sampleRate?: number
   playbackChannels?: number
   startOptions?: AudioStartOptions
+  // opt-in 空闲释放契约:voices 归零并持续该宽限后自动 stop() 完整释放输出通道
+  // (设备会话含 ma_device_uninit;mixer-only 会话停 mixer)。缺省 undefined = 维持
+  // 既有的常驻行为,不影响 examples 等既有消费者。
+  idleReleaseMs?: number
 }
 
 export interface AudioStartOptions {
@@ -95,15 +99,19 @@ export class Audio extends EventEmitter<AudioEvents> {
 
   private readonly lib: RenderLib
   private readonly defaultStartOptions: AudioStartOptions | undefined
+  private readonly idleReleaseMs: number | undefined
   private engine: AudioEngineHandle | null = null
   private readonly groups = new Map<string, number>()
   private playbackStarted = false
   private mixerStarted = false
+  private idleWatchTimer: ReturnType<typeof setInterval> | null = null
+  private idleSince: number | null = null
 
   private constructor(lib: RenderLib, options: AudioSetupOptions) {
     super()
     this.lib = lib
     this.defaultStartOptions = options.startOptions
+    this.idleReleaseMs = options.idleReleaseMs
     const createOptions =
       options.sampleRate == null && options.playbackChannels == null
         ? undefined
@@ -167,6 +175,8 @@ export class Audio extends EventEmitter<AudioEvents> {
 
   stop(): boolean {
     if (!this.mixerStarted) return true
+    // 外部显式停止同样终结看护,避免定时器在停止后继续存活
+    this.clearIdleWatch()
     const engine = this.engine
     if (!engine) {
       this.emitError("stop", undefined, "Audio engine unavailable during stop")
@@ -271,7 +281,48 @@ export class Audio extends EventEmitter<AudioEvents> {
       return null
     }
 
+    // 新播放重置归零锚点:看护必须从本次声音结束后重新计宽限,
+    // 避免上一个声音的锚点导致新声音仍在播时被提前释放。
+    // loop 音无“结束”语义,不排程看护(输入域分支而非失败处理)。
+    if (this.idleReleaseMs != null && !options?.loop) {
+      this.idleSince = null
+      this.scheduleIdleWatch()
+    }
     return result.voiceId
+  }
+
+  // 看护仅在播放后存活到释放/外部 stop,自清不留常驻定时器
+  private scheduleIdleWatch() {
+    if (this.idleWatchTimer) return
+    // 250ms tick:毫秒级轮询 voicesActive 的成本远低于设备重开,
+    // 且宽限值本身为秒级,不需要事件式回调
+    this.idleWatchTimer = setInterval(() => this.idleTick(), 250)
+  }
+
+  private idleTick() {
+    // 守卫取 mixerStarted(stop() 的闸门状态):外部 stop()/dispose 已释放或
+    // 消费者从未启动会话时,看护自毁且不重复释放;device 会话 start() 后两态
+    // 同为 true,行为不受影响。
+    if (!this.mixerStarted) {
+      this.clearIdleWatch()
+      return
+    }
+    if ((this.getStats()?.voicesActive ?? 0) > 0) {
+      this.idleSince = null
+      return
+    }
+    // 锚点在首个观测到归零的 tick 建立:释放时刻 ≥ 声音真实结束 + 宽限
+    this.idleSince ??= Date.now()
+    if (this.idleReleaseMs != null && Date.now() - this.idleSince >= this.idleReleaseMs) {
+      this.clearIdleWatch()
+      this.stop()
+    }
+  }
+
+  private clearIdleWatch() {
+    if (this.idleWatchTimer) clearInterval(this.idleWatchTimer)
+    this.idleWatchTimer = null
+    this.idleSince = null
   }
 
   stopVoice(voice: AudioVoice): boolean {
@@ -464,6 +515,8 @@ export class Audio extends EventEmitter<AudioEvents> {
 
   dispose(): void {
     if (!this.engine) return
+    // mixer 未启动时 stop() 不会破调用,看护也必须在此终结(dispose 是最后清理点)
+    this.clearIdleWatch()
     if (this.mixerStarted) {
       this.stop()
     }

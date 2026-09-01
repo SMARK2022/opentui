@@ -301,3 +301,97 @@ test("audioCreateGroup rejects oversized encoded name lengths before truncating 
     lib.destroyAudioEngine(engine)
   }
 })
+
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms))
+}
+
+test("Audio releases the idle output session after the idleReleaseMs grace", async () => {
+  // mixer-only seam:免设备驱动 voice 消费,验证 opt-in 空闲释放契约(stop() 级完整释放)
+  const audio = Audio.create({ autoStart: false, idleReleaseMs: 60 })
+  audio.on("error", () => {})
+  instances.push(audio)
+
+  const sound = audio.loadSound(buildMonoPcm16Wav([0.5, -0.5, 0.4, -0.4, 0.3, -0.3]))
+  expect(sound).not.toBeNull()
+  if (sound == null) return
+
+  expect(audio.startMixer()).toBe(true)
+  expect(audio.play(sound, { volume: 1, pan: 0, loop: false })).not.toBeNull()
+  for (let i = 0; i < 16; i += 1) audio.mixFrames(64, 2)
+  expect(audio.getStats()?.voicesActive).toBe(0)
+
+  // 等待超过看护 tick 周期 + 宽限,吸收真实定时器漂移:会话应已释放
+  await sleep(1000)
+  expect(audio.isMixerStarted()).toBe(false)
+})
+
+test("Audio restarts the idle grace window when a new voice plays within it", async () => {
+  // 宽限合并契约:上一个声音的归零锚点不得提前释放仍在宽限期内的新声音
+  const audio = Audio.create({ autoStart: false, idleReleaseMs: 800 })
+  audio.on("error", () => {})
+  instances.push(audio)
+
+  const sound = audio.loadSound(buildMonoPcm16Wav([0.5, -0.5, 0.4, -0.4]))
+  expect(sound).not.toBeNull()
+  if (sound == null) return
+
+  expect(audio.startMixer()).toBe(true)
+  expect(audio.play(sound, { volume: 1, loop: false })).not.toBeNull()
+  for (let i = 0; i < 16; i += 1) audio.mixFrames(64, 2)
+  await sleep(300)
+  // 宽限期内二次播放:锚点必须重置,释放时刻从新声音归零起算
+  expect(audio.play(sound, { volume: 1, loop: false })).not.toBeNull()
+  for (let i = 0; i < 16; i += 1) audio.mixFrames(64, 2)
+  expect(audio.getStats()?.voicesActive).toBe(0)
+
+  // 无重置实现会在首锚点 + 800ms(~1050ms)释放;重置后释放 ≥ 二次播放后首 tick + 800ms
+  await sleep(580)
+  expect(audio.isMixerStarted()).toBe(true)
+  await sleep(900)
+  expect(audio.isMixerStarted()).toBe(false)
+})
+
+test("Audio keeps looped voices outside the idle-release contract", async () => {
+  // loop 音无完成语义,不属空闲释放输入域:宽限后必须仍持有会话
+  const audio = Audio.create({ autoStart: false, idleReleaseMs: 100 })
+  audio.on("error", () => {})
+  instances.push(audio)
+
+  const sound = audio.loadSound(buildMonoPcm16Wav([0.5, -0.5, 0.4, -0.4]))
+  expect(sound).not.toBeNull()
+  if (sound == null) return
+
+  expect(audio.startMixer()).toBe(true)
+  expect(audio.play(sound, { volume: 1, loop: true })).not.toBeNull()
+  audio.mixFrames(64, 2)
+  expect(audio.getStats()?.voicesActive).toBeGreaterThan(0)
+
+  await sleep(700)
+  expect(audio.isMixerStarted()).toBe(true)
+  expect(audio.getStats()?.voicesActive).toBeGreaterThan(0)
+})
+
+test("Audio reuses cached sounds after an idle release and replays audibly", async () => {
+  // 释放只关输出通道,音效缓存挂在 noDevice 常驻 engine 上:重开即播且不重新加载
+  const audio = Audio.create({ autoStart: false, idleReleaseMs: 60 })
+  audio.on("error", () => {})
+  instances.push(audio)
+
+  const sound = audio.loadSound(buildMonoPcm16Wav([0.6, -0.6, 0.5, -0.5]))
+  expect(sound).not.toBeNull()
+  if (sound == null) return
+
+  expect(audio.startMixer()).toBe(true)
+  expect(audio.play(sound, { volume: 1, loop: false })).not.toBeNull()
+  for (let i = 0; i < 16; i += 1) audio.mixFrames(64, 2)
+  await sleep(1000)
+  expect(audio.isMixerStarted()).toBe(false)
+  expect(audio.getStats()?.soundsLoaded).toBe(1)
+
+  // 重开 mixer 后同一 sound 句柄直接出声(缓存跨释放存活)
+  expect(audio.startMixer()).toBe(true)
+  expect(audio.play(sound, { volume: 1, loop: false })).not.toBeNull()
+  const mixed = audio.mixFrames(64, 2)
+  expect(mixed?.some((sample) => Math.abs(sample) > 0.001)).toBe(true)
+})

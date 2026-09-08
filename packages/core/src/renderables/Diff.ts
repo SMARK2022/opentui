@@ -106,6 +106,8 @@ export class DiffRenderable extends Renderable {
 
   private _waitingForHighlight: boolean = false
   private _lineInfoChangeHandler: (() => void) | null = null
+  // Diff 自己创建的默认样式由父级退休统一释放；外部 Theme 样式只借用，绝不进入此集合。
+  private ownedSyntaxStyles = new Set<SyntaxStyle>()
 
   constructor(ctx: RenderContext, options: DiffRenderableOptions) {
     super(ctx, {
@@ -175,6 +177,10 @@ export class DiffRenderable extends Renderable {
   }
 
   private buildView(): void {
+    this.buildViewContents()
+  }
+
+  private buildViewContents(): void {
     this._hunkStartLines = []
     this.invalidateHunkRowOffsets()
 
@@ -299,12 +305,28 @@ export class DiffRenderable extends Renderable {
     this._lineInfoChangeHandler = null
   }
 
-  public override destroyRecursively(): void {
+  // destroy() 与 destroyRecursively() 都汇聚到 destroySelf，override 此点即覆盖两个退休入口。
+  protected override destroySelf(): void {
     this.detachLineInfoListeners()
     this.pendingRebuild = false
+    // 通用递归只能到达当前 children；detached 缓存 side/error 子树必须由 Diff 自己终结。
+    // attached child 已被基类递归销毁，isDestroyed 守卫跳过它们，只对 detached 缓存收尾。
+    for (const cached of [this.leftSide, this.rightSide, this.errorTextRenderable, this.errorCodeRenderable]) {
+      if (cached && !cached.isDestroyed) cached.destroyRecursively()
+    }
+    // 缓存字段必须清空，否则下一次 build 会把已销毁对象误判为可复用缓存。
+    this.leftSide = null
     this.leftSideAdded = false
+    this.leftCodeRenderable = null
+    this.rightSide = null
     this.rightSideAdded = false
-    super.destroyRecursively()
+    this.rightCodeRenderable = null
+    this.errorTextRenderable = null
+    this.errorCodeRenderable = null
+    // consumer 先销毁、样式后销毁：Code 只借用 syntaxStyle，不会替 Diff 释放默认样式。
+    // 集合上界为 left/right/error 三份默认样式，外部传入的 Theme 样式不在此列。
+    for (const style of this.ownedSyntaxStyles) style.destroy()
+    this.ownedSyntaxStyles.clear()
   }
 
   private buildErrorView(): void {
@@ -338,11 +360,13 @@ export class DiffRenderable extends Renderable {
     }
 
     if (!this.errorCodeRenderable) {
+      const syntaxStyle = this._syntaxStyle ?? SyntaxStyle.create()
+      if (!this._syntaxStyle) this.ownedSyntaxStyles.add(syntaxStyle)
       this.errorCodeRenderable = new CodeRenderable(this.ctx, {
         id: this.id ? `${this.id}-error-code` : undefined,
         content: this._diff,
         filetype: "diff",
-        syntaxStyle: this._syntaxStyle ?? SyntaxStyle.create(),
+        syntaxStyle,
         wrapMode: this._wrapMode,
         conceal: this._conceal,
         width: "100%",
@@ -373,13 +397,15 @@ export class DiffRenderable extends Renderable {
     const existingRenderable = side === "left" ? this.leftCodeRenderable : this.rightCodeRenderable
 
     if (!existingRenderable) {
+      const syntaxStyle = this._syntaxStyle ?? SyntaxStyle.create()
+      if (!this._syntaxStyle) this.ownedSyntaxStyles.add(syntaxStyle)
       const codeOptions: CodeOptions = {
         id: this.id ? `${this.id}-${side}-code` : undefined,
         content,
         filetype: this._filetype,
         wrapMode,
         conceal: this._conceal,
-        syntaxStyle: this._syntaxStyle ?? SyntaxStyle.create(),
+        syntaxStyle,
         width: "100%",
         height: "100%",
         ...(this._fg !== undefined && { fg: this._fg }),

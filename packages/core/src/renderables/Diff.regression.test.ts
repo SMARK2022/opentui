@@ -1,5 +1,7 @@
 import { test, expect, beforeEach, afterEach } from "bun:test"
+import { Renderable } from "../Renderable.js"
 import { DiffRenderable } from "./Diff.js"
+import { CodeRenderable } from "./Code.js"
 import { SyntaxStyle } from "../syntax-style.js"
 import { RGBA } from "../lib/RGBA.js"
 import { createTestRenderer, type TestRenderer } from "../testing.js"
@@ -345,6 +347,143 @@ test("DiffRenderable - hunk row offsets map concealed hunk starts to the next vi
   await settleDiffHighlighting(diffRenderable, mockClient, renderOnce)
 
   expect(diffRenderable.getHunkRowOffsets()).toEqual([0, 1])
+})
+
+test("DiffRenderable - destroys detached sides with the parent", async () => {
+  const syntaxStyle = SyntaxStyle.fromStyles({
+    default: { fg: RGBA.fromValues(1, 1, 1, 1) },
+  })
+  await renderOnce()
+  // 全量套件中其他文件的异步销毁可能在本用例 await 期间落账，绝对计数会漂移；
+  // 以创建前 registry key 集合为基准，断言本用例新增的 key 全部消失，与跨文件漂移无关。
+  const beforeKeys = new Set(Renderable.renderablesByNumber.keys())
+  try {
+    const diffRenderable = new DiffRenderable(currentRenderer, {
+      id: "test-diff-lifecycle",
+      diff: `--- a/test.ts
++++ b/test.ts
+@@ -1,1 +1,1 @@
+-const value = 1
++const value = 2`,
+      syntaxStyle,
+      filetype: "typescript",
+      treeSitterClient: mockClient,
+    })
+
+    currentRenderer.root.add(diffRenderable)
+    await renderOnce()
+    diffRenderable.view = "split"
+    await renderOnce()
+    // 缓存复用身份必须跨视图转换保持，说明父级退休回收的是固定缓存而不是每次重建。
+    const splitChildren = diffRenderable.getChildren()
+    expect(splitChildren.length).toBe(2)
+    diffRenderable.view = "unified"
+    await renderOnce()
+    diffRenderable.view = "split"
+    await renderOnce()
+    expect(diffRenderable.getChildren()).toEqual(splitChildren)
+    diffRenderable.view = "unified"
+    await renderOnce()
+
+    // 转换后旧 side 不再属于当前 children，但仍是 Diff 创建的 owner，父级销毁必须一并回收。
+    diffRenderable.destroyRecursively()
+
+    expect(splitChildren.every((cached) => cached.isDestroyed)).toBe(true)
+    // 本用例创建的全部 renderable（含无 id 前缀的 gutter 等内部 owner）都必须离开 registry。
+    const leaked = [...Renderable.renderablesByNumber.keys()].filter((key) => !beforeKeys.has(key))
+    expect(leaked).toEqual([])
+    // 外部 Theme 样式只被借用，父级退休不得销毁调用方的样式。
+    expect(() => syntaxStyle.getRegisteredNames()).not.toThrow()
+  } finally {
+    syntaxStyle.destroy()
+  }
+})
+
+test("DiffRenderable - retires cached owners and default styles through destroy", async () => {
+  await renderOnce()
+  const beforeKeys = new Set(Renderable.renderablesByNumber.keys())
+  const diffRenderable = new DiffRenderable(currentRenderer, {
+    id: "test-diff-destroy-entry",
+    diff: `--- a/test.ts
++++ b/test.ts
+@@ -1,1 +1,1 @@
+-const value = 1
++const value = 2`,
+    filetype: "typescript",
+    treeSitterClient: mockClient,
+  })
+
+  currentRenderer.root.add(diffRenderable)
+  await renderOnce()
+  diffRenderable.view = "split"
+  await renderOnce()
+  const splitChildren = diffRenderable.getChildren()
+  // split 视图恰好挂载 left/right 两个 side；只该用例不传外部样式，默认样式才归 Diff 所有。
+  expect(splitChildren.length).toBe(2)
+  const defaultStyles = splitChildren.map((side) => {
+    // 经公开 children 遍历拿到 Code.syntaxStyle 是捕获默认样式身份的唯一公开 seam。
+    const code = side.getChildren().find((child): child is CodeRenderable => child instanceof CodeRenderable)
+    expect(code).toBeDefined()
+    return code!.syntaxStyle
+  })
+  diffRenderable.view = "unified"
+  await renderOnce()
+
+  // destroy 与 destroyRecursively 都经 Renderable.destroy 汇聚到 destroySelf，两个入口的退休语义必须一致。
+  diffRenderable.destroy()
+
+  expect(splitChildren.every((cached) => cached.isDestroyed)).toBe(true)
+  const leaked = [...Renderable.renderablesByNumber.keys()].filter((key) => !beforeKeys.has(key))
+  expect(leaked).toEqual([])
+  // Diff 自己创建的默认样式随父级退休失效；getRegisteredNames 的 guard 是销毁后的公开探针。
+  for (const style of defaultStyles) {
+    expect(() => style.getRegisteredNames()).toThrow()
+  }
+})
+
+test("DiffRenderable - destroys cached error owners across diff transitions", async () => {
+  const syntaxStyle = SyntaxStyle.fromStyles({
+    default: { fg: RGBA.fromValues(1, 1, 1, 1) },
+  })
+  await renderOnce()
+  const beforeKeys = new Set(Renderable.renderablesByNumber.keys())
+  const invalidDiff = `--- a/test.ts
++++ b/test.ts
+@@ -a,b +c,d @@
+ const value = 1
+-const oldValue = 1
++const newValue = 2
+ const tail = true`
+  const validDiff = `--- a/test.ts
++++ b/test.ts
+@@ -1,1 +1,1 @@
+-const value = 1
++const value = 2`
+
+  try {
+    const diffRenderable = new DiffRenderable(currentRenderer, {
+      id: "test-diff-error-lifecycle",
+      diff: invalidDiff,
+      syntaxStyle,
+      filetype: "typescript",
+      treeSitterClient: mockClient,
+    })
+
+    currentRenderer.root.add(diffRenderable)
+    await renderOnce()
+    expect(captureFrame()).toContain("Error parsing diff")
+
+    diffRenderable.diff = validDiff
+    await renderOnce()
+    expect(captureFrame()).toContain("const value = 2")
+
+    diffRenderable.destroyRecursively()
+
+    const leaked = [...Renderable.renderablesByNumber.keys()].filter((key) => !beforeKeys.has(key))
+    expect(leaked).toEqual([])
+  } finally {
+    syntaxStyle.destroy()
+  }
 })
 
 test("DiffRenderable - hunk row offsets account for multiline concealed ranges", async () => {

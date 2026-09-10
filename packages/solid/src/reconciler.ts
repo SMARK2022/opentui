@@ -108,6 +108,40 @@ function _insertNode(parent: DomNode, node: DomNode, anchor?: DomNode): void {
   parent.add(node, anchorIndex)
 }
 
+// 待销毁节点的共享队列与其上限。
+// 现状把每个移除节点的销毁各自 defer 到 process.nextTick：当主线程被连续同步渲染/协调占满、
+// 不 yield 事件循环时，这些 nextTick 回调被饿死，待销毁 renderable（每个约占 4 个 native handle）
+// 积压无界增长，最终耗尽 handles 注册表（MAX_SLOTS=65535）→ Failed to create TextBuffer → TUI 卡死。
+// 这里给积压上硬顶：超过 MAX_PENDING_DESTROY 就同步排干；正常路径仍 defer 到 nextTick，语义不变。
+// 阈值取远小于耗尽余量（存活树约 5-6k renderable ≈ 21k handle，上限 65535）的常量，
+// 使正常滑窗/编辑（每次仅移除个位数节点）永不触发同步 drain，只有失控积压才兜底。
+const MAX_PENDING_DESTROY = 256
+const pendingDestroy: BaseRenderable[] = []
+let destroyFlushScheduled = false
+
+function flushPendingDestroy(): void {
+  destroyFlushScheduled = false
+  const queue = pendingDestroy.splice(0)
+  for (const node of queue) {
+    // 保留 move/reuse 语义：remove 之后又被 re-add（parent 非 null）的节点不销毁。
+    if (!node.parent) node.destroyRecursively()
+  }
+}
+
+function schedulePendingDestroy(node: BaseRenderable): void {
+  pendingDestroy.push(node)
+  // 积压超阈值 → 同步排干，保证连续无空闲负载下也不无界增长。
+  if (pendingDestroy.length >= MAX_PENDING_DESTROY) {
+    flushPendingDestroy()
+    return
+  }
+  // 正常路径：只调度一次 nextTick flush，而不是每个节点各起一个 nextTick。
+  if (!destroyFlushScheduled) {
+    destroyFlushScheduled = true
+    process.nextTick(flushPendingDestroy)
+  }
+}
+
 function _removeNode(parent: DomNode, node: DomNode): void {
   log("Removing node:", logId(node), "from parent:", logId(parent))
 
@@ -130,12 +164,9 @@ function _removeNode(parent: DomNode, node: DomNode): void {
 
   slotParent?.didRemoveSlotChild(parent, node)
 
-  process.nextTick(() => {
-    if (node instanceof BaseRenderable && !node.parent) {
-      node.destroyRecursively()
-      return
-    }
-  })
+  if (node instanceof BaseRenderable) {
+    schedulePendingDestroy(node)
+  }
 }
 
 function _createTextNode(value: string | number): TextNode {

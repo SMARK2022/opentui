@@ -407,6 +407,150 @@ test "OptimizedBuffer - drawTextBuffer repeatedly should not exhaust pool" {
     }
 }
 
+test "buffer - clipped text view cannot exhaust shared grapheme capacity" {
+    // 使用独立池，旧实现的故意耗尽不能污染随后运行的测试。
+    var pool = gp.GraphemePool.init(std.testing.allocator);
+    defer pool.deinit();
+    var links = link.LinkPool.init(std.testing.allocator);
+    defer links.deinit();
+    var text = try TextBuffer.init(std.testing.allocator, &pool, &links, .wcwidth);
+    defer text.deinit();
+    var view = try TextBufferView.init(std.testing.allocator, text);
+    defer view.deinit();
+    var buf = try OptimizedBuffer.init(std.testing.allocator, 12, 1, .{ .pool = &pool, .link_pool = &links, .id = "clipped-view" });
+    defer buf.deinit();
+    buf.clear(ansi.rgbaFromFloats(0, 0, 0, 1), null);
+    try text.setText("测");
+    // 字形本可放入物理行，只是父裁剪区域比双宽字形窄。
+    // scissor 宽度 1 强制每个双宽字形右半越界，使每次绘制都走到被拒绝的分配路径。
+    try buf.pushScissorRect(0, 0, 1, 1);
+    // class0 的槽位编码只有 16 位；达到容量才能暴露未被 tracker 接管的泄漏。
+    for (0..65536) |_| buf.drawTextBuffer(view, 0, 0);
+    buf.popScissorRect();
+    try text.setText("中试文ABC");
+    buf.drawTextBuffer(view, 0, 0);
+    var output: [64]u8 = undefined;
+    const written = try buf.writeResolvedChars(&output, false);
+    // 原文直接作为 oracle；只检查 tracker 大小会漏过未被跟踪的槽位。
+    try std.testing.expectEqualStrings("中试文ABC", std.mem.trimEnd(u8, output[0..written], " "));
+}
+
+test "buffer - clipped direct text cannot exhaust shared grapheme capacity" {
+    var pool = gp.GraphemePool.init(std.testing.allocator);
+    defer pool.deinit();
+    var links = link.LinkPool.init(std.testing.allocator);
+    defer links.deinit();
+    var buf = try OptimizedBuffer.init(std.testing.allocator, 12, 1, .{ .pool = &pool, .link_pool = &links, .id = "clipped-direct" });
+    defer buf.deinit();
+    const fg = ansi.rgbaFromFloats(1, 1, 1, 1);
+    const bg = ansi.rgbaFromFloats(0, 0, 0, 1);
+    buf.clear(bg, null);
+    try buf.pushScissorRect(0, 0, 1, 1);
+    // 第 65537 次仍必须成功，检出 direct draw 的 OutOfMemory 提前结束路径。
+    // 循环上限比 class0 容量多一次：恰好耗尽时最后一次循环必然失败。
+    for (0..65537) |_| try buf.drawText("测", 0, 0, fg, bg, 0);
+    buf.popScissorRect();
+    try buf.drawText("中试文ABC", 0, 0, fg, bg, 0);
+    var output: [64]u8 = undefined;
+    const written = try buf.writeResolvedChars(&output, false);
+    // 同时保护新字形和 ASCII 后缀，避免误把部分前缀当作完整输出。
+    try std.testing.expectEqualStrings("中试文ABC", std.mem.trimEnd(u8, output[0..written], " "));
+}
+
+test "buffer - drawing first-reference failure returns unowned capacity" {
+    // key 与 map 分配分别失败；第三种场景还保留另一字形的真实 buffer 引用。
+    for ([_]bool{ false, true }) |view_draw| {
+        for (0..3) |scenario| {
+            var pool = gp.GraphemePool.init(std.testing.allocator);
+            defer pool.deinit();
+            var links = link.LinkPool.init(std.testing.allocator);
+            defer links.deinit();
+            var buf = try OptimizedBuffer.init(std.testing.allocator, 8, 1, .{ .pool = &pool, .link_pool = &links, .id = "incref-failure" });
+            defer buf.deinit();
+            const fg = ansi.rgbaFromFloats(1, 1, 1, 1);
+            const bg = ansi.rgbaFromFloats(0, 0, 0, 1);
+            buf.clear(bg, null);
+            // scenario 2 先让另一字形持有真实引用，证明故障回收不会误伤借用 ID。
+            if (scenario == 2) try buf.drawText("中", 0, 0, fg, bg, 0);
+            const original = buf.get(0, 0).?.char;
+            var text = try TextBuffer.init(std.testing.allocator, &pool, &links, .wcwidth);
+            defer text.deinit();
+            var view = try TextBufferView.init(std.testing.allocator, text);
+            defer view.deinit();
+            try text.setText("试A");
+            // 预先建立 class 页；仅替换 interning 的 allocator，故障不能误中池增长。
+            const seed = try pool.alloc("试");
+            try pool.freeUnreferenced(seed);
+            {
+                var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = if (scenario == 1) 1 else 0 });
+                pool.allocator = failing.allocator();
+                // assert 失败也必须先恢复 allocator，局部对象不可逃逸到 pool.deinit。
+                defer pool.allocator = std.testing.allocator;
+                if (view_draw) {
+                    buf.drawTextBuffer(view, 2, 0);
+                    // view 原合同保留失败位置空格，同时继续绘制后面的 ASCII。
+                    try std.testing.expectEqual(@as(u32, ' '), buf.get(2, 0).?.char);
+                    try std.testing.expectEqual(@as(u32, 'A'), buf.get(4, 0).?.char);
+                } else {
+                    try std.testing.expectError(error.OutOfMemory, buf.drawText("试A", 2, 0, fg, bg, 0));
+                    try std.testing.expectEqual(@as(u32, ' '), buf.get(4, 0).?.char);
+                }
+                try std.testing.expect(failing.has_induced_failure);
+            }
+            try std.testing.expectEqual(original, buf.get(0, 0).?.char);
+            if (scenario == 2) {
+                const id = gp.graphemeIdFromChar(original);
+                try std.testing.expectEqualStrings("中", try pool.get(id));
+                try std.testing.expectEqual(@as(u32, 1), try pool.getRefcount(id));
+            }
+            // 不以 tracker 计数作泄漏 oracle：逐个占满剩余槽，遗漏回收会少一个。
+            const ids = try std.testing.allocator.alloc(u32, 65536 - @as(usize, if (scenario == 2) 1 else 0));
+            defer std.testing.allocator.free(ids);
+            for (ids) |*id| id.* = try pool.alloc("测");
+            for (ids) |id| try pool.freeUnreferenced(id);
+        }
+    }
+}
+
+test "buffer - same live grapheme alpha redraw preserves clipped styles" {
+    for ([_]bool{ false, true }) |view_draw| {
+        var pool = gp.GraphemePool.init(std.testing.allocator);
+        defer pool.deinit();
+        var links = link.LinkPool.init(std.testing.allocator);
+        defer links.deinit();
+        var buf = try OptimizedBuffer.init(std.testing.allocator, 4, 1, .{ .pool = &pool, .link_pool = &links, .id = "live-alpha" });
+        defer buf.deinit();
+        const fg = ansi.rgbaFromFloats(1, 1, 1, 1);
+        const bg = ansi.rgbaFromFloats(0, 0, 0, 1);
+        buf.clear(bg, null);
+        try buf.drawText("中", 0, 0, fg, bg, 0);
+        const original = buf.get(0, 0).?;
+        const right = buf.get(1, 0).?;
+        const overlay_fg = ansi.rgbaFromFloats(1, 0, 0, 1);
+        const overlay_bg = ansi.rgbaFromFloats(0, 0, 1, 0.5);
+        var text = try TextBuffer.init(std.testing.allocator, &pool, &links, .wcwidth);
+        defer text.deinit();
+        var view = try TextBufferView.init(std.testing.allocator, text);
+        defer view.deinit();
+        try text.setText("中");
+        text.setDefaultFg(overlay_fg);
+        text.setDefaultBg(overlay_bg);
+        text.setDefaultAttributes(ansi.TextAttributes.BOLD);
+        // 同一 live ID 可只更新样式，不能在分配前把半透明绘制一概拒绝。
+        try buf.pushScissorRect(0, 0, 1, 1);
+        if (view_draw) buf.drawTextBuffer(view, 0, 0) else try buf.drawText("中", 0, 0, overlay_fg, overlay_bg, ansi.TextAttributes.BOLD);
+        buf.popScissorRect();
+        try std.testing.expectEqual(original.char, buf.get(0, 0).?.char);
+        try std.testing.expectEqual(overlay_fg, buf.get(0, 0).?.fg);
+        try std.testing.expectEqual(@as(u32, ansi.TextAttributes.BOLD), buf.get(0, 0).?.attributes);
+        // 颜色必须真正改变，而 scissor 外的 continuation 连同原样式必须完全保留。
+        try std.testing.expect(!std.meta.eql(original.bg, buf.get(0, 0).?.bg));
+        try std.testing.expectEqualDeep(right, buf.get(1, 0).?);
+        // 仅剩 tracker 自己的引用：生产者的临时引用必须在绘制返回前已释放。
+        try std.testing.expectEqual(@as(u32, 1), try pool.getRefcount(gp.graphemeIdFromChar(original.char)));
+    }
+}
+
 test "OptimizedBuffer - mixed ASCII and emoji repeated rendering" {
     const pool = gp.initGlobalPool(std.testing.allocator);
     defer gp.deinitGlobalPool();

@@ -1,5 +1,7 @@
 import { test, expect, afterEach } from "bun:test"
 import { Writable } from "stream"
+import { spawnSync } from "node:child_process"
+import { fileURLToPath } from "node:url"
 import { createCliRenderer, CliRenderer, CliRenderEvents } from "../renderer.js"
 import { ManualClock } from "../testing/manual-clock.js"
 import { createTestStdin, TestWriteStream } from "../testing/test-streams.js"
@@ -125,6 +127,56 @@ afterEach(() => {
 })
 
 // ---- Byte-routing behavior ----
+
+test("clipped text subtree preserves other CJK in memory and native output", () => {
+  // 原始缺陷会耗尽全局池；隔离进程让红测不污染同文件其余 renderer 测试。
+  const result = spawnSync("bun", ["--eval", `
+    import assert from "node:assert/strict"
+    import { Writable } from "node:stream"
+    import { CliRenderer, BoxRenderable, TextRenderable, OptimizedBuffer, RGBA } from "./src/index.ts"
+    import { createTestStdin } from "./src/testing/test-streams.ts"
+    const writes = []
+    const stdout = Object.assign(new Writable({ write(chunk, encoding, done) { writes.push(Buffer.from(chunk)); done() } }), {
+      isTTY: true, columns: 20, rows: 4, getColorDepth: () => 24,
+    })
+    const renderer = new CliRenderer(createTestStdin(), stdout, 20, 4, { consoleMode: "disabled", useThread: false })
+    const keep = OptimizedBuffer.create(20, 1, "unicode")
+    const fg = RGBA.fromValues(1, 1, 1, 1), bg = RGBA.fromValues(0, 0, 0, 1)
+    try {
+      const box = new BoxRenderable(renderer, { width: 1, height: 1, overflow: "hidden", flexShrink: 0 })
+      box.add(new TextRenderable(renderer, { content: "测", width: 4, height: 1, wrapMode: "none", flexShrink: 0 }))
+      renderer.root.add(box)
+      // 两个 live 字形必须留下，才能同时检出缓存中文保留、新中文消失的原始现象。
+      keep.drawText("中文", 0, 0, fg, bg)
+      // 65534 帧加两个常驻字形恰好占满 class0：少一帧就无法触发耗尽。
+      for (let frame = 0; frame < 65534; frame++) {
+        renderer.nextRenderBuffer.clear(bg)
+        renderer.root.render(renderer.nextRenderBuffer, 16)
+      }
+      box.visible = false
+      renderer.root.add(new TextRenderable(renderer, { content: "中试文ABC", width: 20, height: 1 }))
+      renderer.nextRenderBuffer.clear(bg)
+      renderer.root.render(renderer.nextRenderBuffer, 16)
+      assert.equal(new TextDecoder().decode(renderer.nextRenderBuffer.getRealCharBytes(true)).trimEnd(), "中试文ABC")
+      // 内存正确不等于输出正确；另经正常 native feed 输出并检验实际 UTF-8 字节。
+      renderer.requestRender()
+      await renderer.idle()
+      const output = Buffer.concat(writes).toString("utf8")
+      for (const glyph of "中试文ABC") assert.ok(output.includes(glyph), "native output missing " + glyph)
+    } finally {
+      renderer.destroy()
+      keep.destroy()
+    }
+  `], {
+    cwd: fileURLToPath(new URL("../..", import.meta.url)),
+    encoding: "utf8",
+    timeout: 30000,
+  })
+  // 超时、初始化失败和原文断言失败都必须成为明确失败，不能仅检查子进程 stdout。
+  expect(result.error).toBeUndefined()
+  expect(result.stderr).toBe("")
+  expect(result.status).toBe(0)
+}, 35000)
 
 test("non-process stdout: rendered bytes flow to the custom Writable", async () => {
   const stdin = createTestStdin()

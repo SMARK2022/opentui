@@ -1167,7 +1167,7 @@ pub const UnifiedTextBufferView = struct {
                             const remaining_on_line = if (wctx.line_position < line_wrap_w) line_wrap_w - wctx.line_position else 0;
 
                             var last_wrap_that_fits: ?u32 = null;
-                            var saved_wrap_idx = wrap_idx;
+                            // 断点索引与列换算游标必须同向推进；只回退索引会从宽字形内部重新切行。
                             while (wrap_idx < wrap_offsets.len) : (wrap_idx += 1) {
                                 const wrap_break = wrap_offsets[wrap_idx];
 
@@ -1186,9 +1186,7 @@ pub const UnifiedTextBufferView = struct {
                                     break;
                                 }
                                 last_wrap_that_fits = width_to_boundary;
-                                saved_wrap_idx = wrap_idx + 1;
                             }
-                            wrap_idx = saved_wrap_idx;
 
                             var to_add: u32 = 0;
                             var has_wrap_after: bool = false;

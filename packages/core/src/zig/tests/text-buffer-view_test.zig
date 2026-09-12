@@ -767,6 +767,32 @@ test "TextBufferView word wrapping - CJK boundary keeps byte and column offsets 
     }
 }
 
+test "TextBufferView word wrapping - skipped boundaries never split later graphemes" {
+    var pool = gp.GraphemePool.init(std.testing.allocator);
+    defer pool.deinit();
+    var links = link.LinkPool.init(std.testing.allocator);
+    defer links.deinit();
+    var tb = try TextBuffer.init(std.testing.allocator, &pool, &links, .unicode);
+    defer tb.deinit();
+    var view = try TextBufferView.init(std.testing.allocator, tb);
+    defer view.deinit();
+    try tb.setText("丁丁b😀甲.丁乙");
+    // unicode 测宽下 emoji 占两列；断点若落入其内部，虚拟行会从半个字形开始。
+    view.setWrapMode(.word);
+    view.setWrapWidth(2);
+    const lines = view.getVirtualLines();
+    // 两列放不下下一完整字形时必须换行，不能让后续行从 emoji 的第二列开始。
+    const starts = [_]u32{ 0, 2, 4, 5, 7, 9, 10, 12 };
+    const widths = [_]u32{ 2, 2, 1, 2, 2, 1, 2, 2 };
+    try std.testing.expectEqual(starts.len, lines.len);
+    // 字面边界独立于换行算法，末字重复或遗漏不能被总行数相同掩盖。
+    for (lines, starts, widths) |line, start, width| {
+        try std.testing.expectEqual(width, line.width_cols);
+        try std.testing.expectEqual(@as(usize, 1), line.chunks.items.len);
+        try std.testing.expectEqual(start, line.chunks.items[0].grapheme_start);
+    }
+}
+
 test "TextBufferView word wrapping - tab width decrease terminates after bytes are consumed" {
     // tab width在写入后缩小时，stored column width可能大于剩余UTF-8 bytes能表达的宽度。
     // byte boundary是终止权威；测试要求有限virtual lines而不是依赖超时发现死循环。

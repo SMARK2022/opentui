@@ -472,6 +472,38 @@ pub const OptimizedBuffer = struct {
         self.setInternal(true, x, y, cell);
     }
 
+    fn clipsGraphemeRight(self: *const OptimizedBuffer, x: u32, y: u32, span_width: u32) bool {
+        // 物理行尾填空与 scissor 的原子拒绝是不同合同，不能合并为同一个提前返回。
+        return span_width > 1 and x + span_width <= self.width and !self.isPointInScissor(@intCast(x + span_width - 1), @intCast(y));
+    }
+
+    fn writeGrapheme(self: *OptimizedBuffer, bytes: []const u8, width: u32, x: u32, y: u32, fg: RGBA, bg: RGBA, attributes: u32, blend: bool) gp.GraphemePoolError!void {
+        if (!self.isPointInScissor(@intCast(x), @intCast(y))) return;
+        const opacity = self.getCurrentOpacity();
+        if (blend and isFullyTransparent(opacity, fg, bg)) return;
+        // 与 packGraphemeStart 的编码 span 一致；调用者仍按原始逻辑宽度推进。
+        const span_width = @min(width, gp.CHAR_EXT_MASK + 1);
+        // 半透明的同字形重绘可能只更新可见 cell 样式，必须让原 blending 判断。
+        if ((!blend or isFullyOpaque(opacity, fg, bg)) and self.clipsGraphemeRight(x, y, span_width)) return;
+
+        const id = try self.pool.alloc(bytes);
+        // alloc 也会返回其他 buffer 持有的 live ID，只释放本次建立的临时引用。
+        self.pool.incref(id) catch |err| {
+            // 首次 interning 失败尚未发布引用；未交付的槽位仍由生产者负责回收。
+            self.pool.freeUnreferenced(id) catch @panic("Invalid pending grapheme");
+            return err;
+        };
+        // defer 覆盖 setter 的全部返回路径，避免在每个拒绝分支重复释放逻辑。
+        defer self.pool.decref(id) catch @panic("Invalid drawing grapheme reference");
+        const cell = makeCell(gp.packGraphemeStart(id & gp.GRAPHEME_ID_MASK, width), fg, bg, attributes);
+        if (blend) {
+            _ = self.setCellWithAlphaBlendingCell(x, y, cell);
+        } else {
+            self.set(x, y, cell);
+        }
+        // setter 接管时 tracker 保有独立引用；裁剪或行尾未接管则在本次调用内释放。
+    }
+
     fn setInternal(self: *OptimizedBuffer, comptime span_cleanup: bool, x: u32, y: u32, cell: Cell) void {
         const index = self.validateAndIndex(x, y) orelse return;
         // 跨 scissor 右边界的宽 grapheme 必须在任何 mutation（tracker 更新、旧 span 清理、cell 写入）
@@ -480,7 +512,7 @@ pub const OptimizedBuffer = struct {
         // 下方既有 EOL 分支处理，与左边界“起始越界跳过整字”对称。
         if (gp.isGraphemeChar(cell.char)) {
             const span_width: u32 = 1 + gp.charRightExtent(cell.char);
-            if (span_width > 1 and x + span_width <= self.width and !self.isPointInScissor(@intCast(x + span_width - 1), @intCast(y))) return;
+            if (self.clipsGraphemeRight(x, y, span_width)) return;
         }
         const prev_char = self.buffer.char[index];
         const prev_link_id = ansi.TextAttributes.getLinkId(self.buffer.attributes[index]);
@@ -1273,22 +1305,16 @@ pub const OptimizedBuffer = struct {
                 continue;
             }
 
-            var encoded_char: u32 = 0;
             if (grapheme_bytes.len == 1 and cell_width == 1 and grapheme_bytes[0] >= 32) {
-                encoded_char = @as(u32, grapheme_bytes[0]);
+                const cell = makeCell(@as(u32, grapheme_bytes[0]), fg, bgColor, attributes);
+                if (isRGBAWithAlpha(bgColor)) {
+                    _ = self.setCellWithAlphaBlendingCell(charX, y, cell);
+                } else {
+                    self.set(charX, y, cell);
+                }
             } else {
-                const gid = self.pool.alloc(grapheme_bytes) catch return BufferError.OutOfMemory;
-                encoded_char = gp.packGraphemeStart(gid & gp.GRAPHEME_ID_MASK, cell_width);
-            }
-
-            if (isRGBAWithAlpha(bgColor)) {
-                _ = self.setCellWithAlphaBlendingCell(
-                    charX,
-                    y,
-                    makeCell(encoded_char, fg, bgColor, attributes),
-                );
-            } else {
-                self.set(charX, y, makeCell(encoded_char, fg, bgColor, attributes));
+                // direct 绘制仍由原背景 alpha 决定写入路径，不改前景或 opacity 合同。
+                self.writeGrapheme(grapheme_bytes, cell_width, charX, y, fg, bgColor, attributes, isRGBAWithAlpha(bgColor)) catch return BufferError.OutOfMemory;
             }
 
             advance_cells += cell_width;
@@ -1796,20 +1822,8 @@ pub const OptimizedBuffer = struct {
                                 makeCell(char, fg, drawBg, drawAttributes),
                             );
                         }
-                    } else {
-                        var encoded_char: u32 = 0;
-                        if (grapheme_bytes.len == 1 and g_width == 1 and grapheme_bytes[0] >= 32) {
-                            encoded_char = @as(u32, grapheme_bytes[0]);
-                        } else {
-                            const gid = self.pool.alloc(grapheme_bytes) catch |err| {
-                                logger.warn("GraphemePool.alloc FAILED for grapheme (len={d}, bytes={any}): {}", .{ grapheme_bytes.len, grapheme_bytes, err });
-                                globalCharPos += g_width;
-                                currentX += @as(i32, @intCast(g_width));
-                                col += g_width;
-                                continue;
-                            };
-                            encoded_char = gp.packGraphemeStart(gid & gp.GRAPHEME_ID_MASK, g_width);
-                        }
+                    } else if (grapheme_bytes.len == 1 and g_width == 1 and grapheme_bytes[0] >= 32) {
+                        const encoded_char = @as(u32, grapheme_bytes[0]);
 
                         if (useTransparentTextFastPath) {
                             const index = self.coordsToIndex(@intCast(currentX), @intCast(currentY));
@@ -1827,6 +1841,15 @@ pub const OptimizedBuffer = struct {
                             @intCast(currentY),
                             makeCell(encoded_char, drawFg, drawBg, drawAttributes),
                         );
+                    } else {
+                        // ASCII 快速路径拒绝所有编码字形，字形直接走唯一引用交接路径。
+                        self.writeGrapheme(grapheme_bytes, g_width, @intCast(currentX), @intCast(currentY), drawFg, drawBg, drawAttributes, true) catch |err| {
+                                logger.warn("GraphemePool.alloc FAILED for grapheme (len={d}, bytes={any}): {}", .{ grapheme_bytes.len, grapheme_bytes, err });
+                                globalCharPos += g_width;
+                                currentX += @as(i32, @intCast(g_width));
+                                col += g_width;
+                                continue;
+                        };
                     }
 
                     globalCharPos += g_width;
